@@ -2,197 +2,262 @@
 Bus router — Hasadna Open Bus Stride API (public, no auth).
 https://open-bus-stride-api.hasadna.org.il
 
-Real-time join path (confirmed from live API field inspection):
-  siri_vehicle_locations
-      .siri_route__line_ref        ─┐
-      .siri_route__operator_ref    ─┤─▶  gtfs_routes
-      + today's date               ─┘       .route_short_name  ← "430", "28", "5"
-                                             .agency_name       ← "סופרבוס", "אגד"
+REAL-TIME ENGINE v4 — date-anchored arrival display:
+- All times in Asia/Jerusalem via pytz
+- Ghost bus filter: vehicles silent > 10 min dropped from map
+- is_live=False: vehicles silent 5–10 min (shown but no pulsing ring)
+- Station board uses aimed_arrival_time (stop-specific), NOT ride start time
+- DATE ANCHOR: "which day" is always decided by aimed_arrival_time in IL tz.
+  expected_arrival_time is only used for the countdown if it is within ±60 min
+  of aimed_arrival_time — otherwise it is a stale/corrupt value and is ignored.
+- Already-passed stops (actual_arrival_time set) are skipped
+- Query window extended backward 2 h to catch in-progress routes
+- print() calls dump raw API responses so you can verify real data is fetched
 """
+import logging
 from fastapi import APIRouter, Query
 import httpx
 import time
+import math
+import pytz
 from datetime import datetime, timezone, timedelta
-from zoneinfo import ZoneInfo
 
-IL_TZ = ZoneInfo("Asia/Jerusalem")
+from services.siri_service import (
+    fetch_arrivals_for_stop,
+    fetch_live_vehicles,
+    haversine_km,
+    arrival_display,
+    IL_TZ,
+    TIBERIAS_LAT, TIBERIAS_LON, TIBERIAS_RADIUS_KM,
+    _parse_iso, _fmt_il, _ts,          # keep internal helpers accessible in this file
+    _fill_route_names, _rsn_cache,
+)
 
+logger = logging.getLogger("buses")
 router = APIRouter()
-BASE = "https://open-bus-stride-api.hasadna.org.il"
+BASE  = "https://open-bus-stride-api.hasadna.org.il"
+
+GHOST_CUTOFF_MIN = 10   # vehicles silent > 10 min: dropped from map entirely
+LIVE_CUTOFF_MIN  = 5    # vehicles silent 5–10 min: shown, is_live=False, no pulse ring
+
+# ── TEST MODE: default location = Tiberias, 2 km radius ──────────────────────
+# These are the bbox corners for a 2 km radius around Tiberias (32.7922, 35.5312).
+# lat_delta  = 2 / 111.0          ≈ 0.018°
+# lon_delta  = 2 / (111.0 * cos(32.79°)) ≈ 0.0215°
+_TIB_LAT = 32.7922
+_TIB_LON = 35.5312
+_TIB_LAT_MIN = round(_TIB_LAT - 0.018,  4)   # 32.7742
+_TIB_LAT_MAX = round(_TIB_LAT + 0.018,  4)   # 32.8102
+_TIB_LON_MIN = round(_TIB_LON - 0.0215, 4)   # 35.5097
+_TIB_LON_MAX = round(_TIB_LON + 0.0215, 4)   # 35.5527
 
 # ── route_short_name cache ─────────────────────────────────────────────────────
-# Key: (line_ref: int, operator_ref: int)  →  (route_short_name: str, agency_name: str)
 _rsn_cache: dict[tuple[int, int], tuple[str, str]] = {}
-_rsn_cache_date: str = ""          # YYYY-MM-DD the cache was built for
-_rsn_cache_ops: frozenset[int] = frozenset()   # operator_refs already cached
+_rsn_cache_date: str = ""
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# INTERNAL HELPERS
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _parse_iso(s: str | None) -> datetime | None:
+    """Parse any ISO-8601 string → UTC-aware datetime. Returns None on failure."""
+    if not s:
+        return None
+    try:
+        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    except Exception:
+        return None
+
+
+def _fmt_il(dt: datetime) -> str:
+    """Format a UTC-aware datetime as HH:MM in Asia/Jerusalem local time."""
+    return dt.astimezone(IL_TZ).strftime("%H:%M")
+
+
+def _arrival_display(
+    aimed_utc: datetime | None,
+    expected_utc: datetime | None,
+    now_utc: datetime,
+) -> tuple[str, str]:
+    """
+    Three-priority Moovit-style arrival display.
+
+    DATE ANCHOR RULE — the "which day is this bus?" check always uses
+    aimed_arrival_time, never expected_arrival_time.  The SIRI feed can
+    carry stale expected_arrival_time values (e.g. from a previous run of the
+    same route) that look like they are 2 minutes away.  We only trust
+    expected_arrival_time for the countdown IF it is within ±60 minutes of
+    aimed_arrival_time — otherwise we fall back to aimed.
+
+    Returns (display_string, display_type):
+      "realtime"  — Priority 1: valid expected_arrival_time, < 30 min away
+      "scheduled" — Priority 2: no valid real-time, or ≥ 30 min; planned time
+      "next_day"  — Priority 3: aimed_arrival_time is tomorrow (IL time)
+      "departed"  — bus already passed (aimed is in the past)
+    """
+    if aimed_utc is None:
+        return "—", "scheduled"
+
+    now_il   = now_utc.astimezone(IL_TZ)
+    aimed_il = aimed_utc.astimezone(IL_TZ)
+
+    # ── DATE ANCHOR: which calendar day is this bus? ─────────────────────────
+    # Always decided by aimed_arrival_time, not by expected_arrival_time.
+    if aimed_il.date() < now_il.date():
+        # Yesterday's ride leaked through the query window — discard
+        return "עבר", "departed"
+
+    if aimed_il.date() > now_il.date():
+        # Priority 3: bus runs tomorrow (Israel calendar)
+        return f"מחר ב-{aimed_il.strftime('%H:%M')}", "next_day"
+
+    # ── Today's bus ──────────────────────────────────────────────────────────
+    # Sanity-check expected_arrival_time: only trust it if it is within
+    # ±60 minutes of the scheduled aimed time.  A drift > 60 min almost
+    # certainly means the field contains stale data from a previous ride.
+    eta_utc = aimed_utc  # default: use scheduled time
+    using_realtime = False
+    if expected_utc is not None:
+        drift_sec = abs((expected_utc - aimed_utc).total_seconds())
+        if drift_sec <= 3600:          # within 60 minutes → believable
+            eta_utc = expected_utc
+            using_realtime = True
+        else:
+            print(
+                f"[buses] IGNORED stale expected_arrival_time "
+                f"(drift {drift_sec/60:.1f} min from aimed): "
+                f"aimed={_fmt_il(aimed_utc)}  expected={_fmt_il(expected_utc)}"
+            )
+
+    # ── EXACT SUBTRACTION: datetime.now(UTC) − ExpectedArrivalTime ──────────
+    mins = int((eta_utc - now_utc).total_seconds() / 60)   # ← THE LINE
+    # ────────────────────────────────────────────────────────────────────────
+
+    if mins < 0:
+        return "עבר", "departed"
+    if mins == 0:
+        return "מגיע", "realtime" if using_realtime else "scheduled"
+
+    # Priority 1: real-time data is valid and bus arrives in < 30 min
+    if using_realtime and mins < 30:
+        if mins == 1:
+            return "בעוד דקה", "realtime"
+        return f"בעוד {mins} דקות", "realtime"
+
+    # Priority 2: no usable real-time, or ≥ 30 min — show planned clock time
+    eta_il = eta_utc.astimezone(IL_TZ)
+    return f"מתוכנן ל-{eta_il.strftime('%H:%M')}", "scheduled"
+
+
+def _ts(dt: datetime | None) -> str:
+    """Return ISO string with UTC offset, or empty string."""
+    if dt is None:
+        return ""
+    return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S+00:00")
+
+
+def _haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """Great-circle distance in kilometres between two WGS-84 points."""
+    R = 6371.0
+    dlat = math.radians(lat2 - lat1)
+    dlon = math.radians(lon2 - lon1)
+    a = math.sin(dlat / 2) ** 2 + math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) * math.sin(dlon / 2) ** 2
+    return R * 2 * math.asin(math.sqrt(a))
 
 
 async def _fill_route_names(
-    pairs: list[tuple[int, int]],   # [(line_ref, operator_ref), ...]
+    pairs: list[tuple[int, int]],
     client: httpx.AsyncClient,
 ) -> None:
-    """
-    Populate _rsn_cache for the given (line_ref, operator_ref) pairs.
-
-    One API call:
-      GET /gtfs_routes/list
-          ?line_refs=A,B,C
-          &operator_refs=X,Y
-          &date_from=TODAY
-          &limit=2000
-    gtfs_routes has BOTH line_ref and operator_ref so we join directly —
-    no intermediate siri_routes step needed.
-    """
-    global _rsn_cache, _rsn_cache_date, _rsn_cache_ops
-
-    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    """Batch-resolve (line_ref, operator_ref) → (route_short_name, agency_name)."""
+    global _rsn_cache, _rsn_cache_date
+    today   = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     missing = [(lr, op) for lr, op in pairs if (lr, op) not in _rsn_cache]
     if not missing:
         return
-
-    unique_lrs  = list({lr for lr, _ in missing})
-    unique_ops  = list({op for _, op in missing})
-
     try:
-        resp = await client.get(
-            f"{BASE}/gtfs_routes/list",
-            params={
-                "line_refs":     ",".join(str(x) for x in unique_lrs),
-                "operator_refs": ",".join(str(x) for x in unique_ops),
-                "date_from":     today,
-                "limit":         2000,
-            },
-            timeout=12.0,
-        )
+        params = {
+            "line_refs":     ",".join(str(lr) for lr, _ in missing),
+            "operator_refs": ",".join(str(op) for _, op in missing),
+            "date_from":     today,
+            "limit":         2000,
+        }
+        print(f"[buses] GET /gtfs_routes/list  params={params}")
+        resp = await client.get(f"{BASE}/gtfs_routes/list", params=params, timeout=12.0)
         if resp.status_code != 200:
+            print(f"[buses] gtfs_routes HTTP {resp.status_code}: {resp.text[:200]}")
             return
-        for row in resp.json():
-            lr  = row.get("line_ref")
-            op  = row.get("operator_ref")
-            rsn = row.get("route_short_name") or ""
+        rows = resp.json()
+        print(f"[buses] gtfs_routes returned {len(rows)} rows")
+        for row in rows:
+            lr    = row.get("line_ref")
+            op    = row.get("operator_ref")
+            rsn   = row.get("route_short_name") or ""
             agency = row.get("agency_name") or ""
             if lr is not None and op is not None and rsn:
                 _rsn_cache[(int(lr), int(op))] = (str(rsn), str(agency))
         _rsn_cache_date = today
-    except Exception:
-        pass
+    except Exception as exc:
+        print(f"[buses] _fill_route_names error: {exc}")
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# /live  —  real-time vehicle positions
-# ──────────────────────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# /live  — real-time bus positions
+# ══════════════════════════════════════════════════════════════════════════════
 
 @router.get("/live")
 async def get_live_buses(
-    limit: int   = Query(default=200, le=500),
-    lat_min: float = Query(default=29.3),
-    lat_max: float = Query(default=33.5),
-    lon_min: float = Query(default=34.0),
-    lon_max: float = Query(default=36.2),
+    limit: int     = Query(default=200, le=500),
+    lat_min: float = Query(default=_TIB_LAT_MIN),   # Tiberias 2 km south
+    lat_max: float = Query(default=_TIB_LAT_MAX),   # Tiberias 2 km north
+    lon_min: float = Query(default=_TIB_LON_MIN),   # Tiberias 2 km west
+    lon_max: float = Query(default=_TIB_LON_MAX),   # Tiberias 2 km east
     line_ref: str | None = Query(default=None),
 ):
     """
-    Fetch real-time bus GPS positions from the Israel Ministry of Transport
-    SIRI feed (via Hasadna Open Bus Stride proxy).
+    Real-time bus positions from the Israel MOT SIRI feed (via Hasadna proxy).
 
-    Steps:
-      1. GET /siri_vehicle_locations/list  — positions recorded in the last 5 min
-      2. Filter client-side to the requested bounding box
-      3. GET /gtfs_routes/list             — resolve route_short_name + agency_name
+    Defaults to Tiberias 2 km radius for testing.
+    The frontend overrides lat_min/max/lon_min/max with the current map viewport.
+
+    Filters applied in order:
+      1. Bbox pre-filter  (fast, eliminates most of Israel)
+      2. Haversine check  (exact 2 km circle when request uses default Tiberias bbox)
+      3. Ghost-bus filter (GPS > 10 min old → dropped entirely)
+      4. Live flag        (GPS > 5 min old → is_live=False, no pulse ring)
+      5. Dedup by vehicle_ref (keep only latest position per physical bus)
     """
-    now_utc   = datetime.now(timezone.utc)
-    time_from = (now_utc - timedelta(hours=2)).strftime("%Y-%m-%dT%H:%M:%S+00:00")
+    now_utc      = _utcnow()
+    now_il       = now_utc.astimezone(IL_TZ)
+    ghost_cutoff = now_utc - timedelta(minutes=GHOST_CUTOFF_MIN)
+    live_cutoff  = now_utc - timedelta(minutes=LIVE_CUTOFF_MIN)
+    time_from    = (now_utc - timedelta(minutes=15)).strftime("%Y-%m-%dT%H:%M:%S+00:00")
+
+    radius_km = max(2.0, haversine_km(lat_min, lon_min, lat_max, lon_max) / 2)
 
     try:
-        async with httpx.AsyncClient(timeout=30.0) as client:
-
-            # ── Step 1: fetch fresh SIRI vehicle locations ────────────────────
-            resp = await client.get(
-                f"{BASE}/siri_vehicle_locations/list",
-                params={
-                    "limit":                  1000,
-                    "order_by":               "id desc",
-                    "recorded_at_time_from":  time_from,
-                },
-                timeout=15.0,
-            )
-            resp.raise_for_status()
-            raw_items = resp.json()
-
-            # ── Step 2: bbox + dedup filter ───────────────────────────────────
-            buses: list[dict] = []
-            seen_vrefs: set[str] = set()
-
-            for item in raw_items:
-                lat = item.get("lat")
-                lon = item.get("lon")
-                if lat is None or lon is None:
-                    continue
-                if not (lat_min <= lat <= lat_max and lon_min <= lon <= lon_max):
-                    continue
-
-                lr  = item.get("siri_route__line_ref")
-                op  = item.get("siri_route__operator_ref")
-
-                if line_ref is not None:
-                    if lr is None or str(lr) != str(line_ref):
-                        continue
-
-                vref = item.get("siri_ride__vehicle_ref") or ""
-                if vref:
-                    if vref in seen_vrefs:
-                        continue
-                    seen_vrefs.add(vref)
-
-                if len(buses) >= limit:
-                    break
-
-                buses.append({
-                    "id":            f"bus_{item['id']}",
-                    "lat":           lat,
-                    "lon":           lon,
-                    "bearing":       item.get("bearing") or 0,
-                    "velocity":      item.get("velocity") or 0,
-                    "line_ref":      lr,
-                    "operator_ref":  op,
-                    "vehicle_ref":   vref,
-                    "journey_ref":   item.get("siri_ride__journey_ref"),
-                    "recorded_at":   item.get("recorded_at_time"),
-                    "source":        "siri_live",
-                    "type":          "bus",
-                    # placeholders filled in step 3
-                    "route_short_name": str(lr) if lr is not None else "?",
-                    "operator":      op,
-                    "agency_name":   "",
-                })
-
-            # ── Step 3: resolve route_short_name via gtfs_routes ─────────────
-            if buses:
-                pairs = [
-                    (int(b["line_ref"]), int(b["operator_ref"]))
-                    for b in buses
-                    if b["line_ref"] is not None and b["operator_ref"] is not None
-                ]
-                await _fill_route_names(pairs, client)
-
-                for b in buses:
-                    lr = b["line_ref"]
-                    op = b["operator_ref"]
-                    if lr is not None and op is not None:
-                        rsn, agency = _rsn_cache.get((int(lr), int(op)), ("", ""))
-                        if rsn:
-                            b["route_short_name"] = rsn
-                            b["agency_name"]      = agency
-
-            return {
-                "buses":     buses,
-                "count":     len(buses),
-                "source":    "hasadna_siri",
-                "time_from": time_from,
-                "timestamp": int(now_utc.timestamp()),
-            }
-
+        buses = await fetch_live_vehicles(
+            lat_min=lat_min, lat_max=lat_max,
+            lon_min=lon_min, lon_max=lon_max,
+            radius_km=radius_km,
+            limit=limit,
+        )
+        return {
+            "buses":     buses,
+            "count":     len(buses),
+            "source":    "hasadna_siri",
+            "timestamp": int(time.time()),
+        }
     except Exception as e:
+        logger.error("live endpoint error: %s", e)
         return {
             "buses":          [],
             "count":          0,
@@ -202,9 +267,9 @@ async def get_live_buses(
         }
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# /stops  —  GTFS bus stops by city / bbox
-# ──────────────────────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# /stops  — GTFS stop search
+# ══════════════════════════════════════════════════════════════════════════════
 
 @router.get("/stops")
 async def search_stops(
@@ -217,8 +282,8 @@ async def search_stops(
     limit: int = Query(default=100, le=300),
 ):
     params: dict = {
-        "limit": 500,
-        "date_from": datetime.now().strftime("%Y-%m-%d"),
+        "limit":     500,
+        "date_from": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
     }
     if code:
         params["code"] = code
@@ -258,101 +323,72 @@ async def search_stops(
         return {"stops": [], "count": 0, "error": str(e)}
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# /station-board  —  upcoming departures at a stop
-# ──────────────────────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# /station-board  — departure board for a stop
+# ══════════════════════════════════════════════════════════════════════════════
 
 @router.get("/station-board")
 async def get_station_board(
     stop_code: int = Query(...),
     window_hours: int = Query(default=2, le=6),
 ):
+    """
+    Real-time departure board delegated entirely to siri_service.
+    All fetching, logging, and time calculations happen there.
+    """
     try:
-        async with httpx.AsyncClient(timeout=15.0) as client:
-            # 1. Resolve stop code → siri stop id
-            r1 = await client.get(
-                f"{BASE}/siri_stops/list",
-                params={"codes": stop_code, "limit": 5},
-            )
-            siri_stops = r1.json()
-            if not siri_stops or not isinstance(siri_stops, list) or not siri_stops[0].get("id"):
-                return {"stop_code": stop_code, "arrivals": [], "error": "Stop not found"}
+        now_utc = datetime.now(timezone.utc)
+        now_il  = now_utc.astimezone(IL_TZ)
 
-            siri_stop_ids = [str(s["id"]) for s in siri_stops[:3]]
-
-            # 2. Fetch upcoming scheduled arrivals
-            now = datetime.now(timezone.utc)
-            time_to = now + timedelta(hours=window_hours)
-
-            r2 = await client.get(
-                f"{BASE}/siri_ride_stops/list",
-                params={
-                    "siri_stop_ids": ",".join(siri_stop_ids),
-                    "siri_ride__scheduled_start_time_from": now.strftime("%Y-%m-%dT%H:%M:%S+00:00"),
-                    "siri_ride__scheduled_start_time_to":   time_to.strftime("%Y-%m-%dT%H:%M:%S+00:00"),
-                    "limit": 30,
-                    "order_by": "siri_ride__scheduled_start_time asc",
-                },
-                timeout=12.0,
-            )
-            rides = r2.json() if r2.status_code == 200 else []
-
-            # 3. Resolve route_short_name for all rides in one batch
-            pairs = [
-                (int(r["siri_route__line_ref"]), int(r["siri_route__operator_ref"]))
-                for r in (rides if isinstance(rides, list) else [])
-                if r.get("siri_route__line_ref") and r.get("siri_route__operator_ref")
-            ]
-            if pairs:
-                await _fill_route_names(pairs, client)
-
-            # 4. GTFS stop name
-            r3 = await client.get(
+        # Fetch stop metadata in parallel with arrivals
+        async with httpx.AsyncClient(timeout=12.0) as client:
+            r = await client.get(
                 f"{BASE}/gtfs_stops/list",
                 params={"code": stop_code, "limit": 1,
-                        "date_from": now.strftime("%Y-%m-%d")},
+                        "date_from": now_utc.strftime("%Y-%m-%d")},
+                timeout=8.0,
             )
-            gtfs = r3.json() if r3.status_code == 200 else []
-            stop_name = gtfs[0].get("name", f"תחנה {stop_code}") if gtfs else f"תחנה {stop_code}"
-            stop_city = gtfs[0].get("city", "")   if gtfs else ""
-            stop_lat  = gtfs[0].get("lat")         if gtfs else None
-            stop_lon  = gtfs[0].get("lon")         if gtfs else None
+        gtfs      = r.json() if r.status_code == 200 else []
+        stop_name = gtfs[0].get("name", f"תחנה {stop_code}") if gtfs else f"תחנה {stop_code}"
+        stop_city = gtfs[0].get("city", "")  if gtfs else ""
+        stop_lat  = gtfs[0].get("lat")        if gtfs else None
+        stop_lon  = gtfs[0].get("lon")        if gtfs else None
 
-            arrivals = []
-            for ride in (rides if isinstance(rides, list) else []):
-                sched = ride.get("siri_ride__scheduled_start_time", "")
-                lr    = ride.get("siri_route__line_ref")
-                op    = ride.get("siri_route__operator_ref")
-                rsn, agency = ("", "")
-                if lr is not None and op is not None:
-                    rsn, agency = _rsn_cache.get((int(lr), int(op)), ("", ""))
-                arrivals.append({
-                    "line_ref":          lr,
-                    "route_short_name":  rsn or (str(lr) if lr else "?"),
-                    "agency_name":       agency,
-                    "operator":          op,
-                    "scheduled_time":    sched,
-                    "scheduled_display": _fmt_time(sched),
-                    "vehicle_ref":       ride.get("siri_ride__vehicle_ref"),
-                })
+        # Distance from Tiberias reference point (for UI display)
+        stop_dist_km = None
+        if stop_lat is not None and stop_lon is not None:
+            stop_dist_km = round(haversine_km(TIBERIAS_LAT, TIBERIAS_LON, stop_lat, stop_lon), 2)
 
-            return {
-                "stop_code":  stop_code,
-                "stop_name":  stop_name,
-                "stop_city":  stop_city,
-                "stop_lat":   stop_lat,
-                "stop_lon":   stop_lon,
-                "arrivals":   arrivals,
-                "window_hours": window_hours,
-                "timestamp":  int(time.time()),
-            }
+        # Delegate all SIRI fetching to siri_service
+        arrivals = await fetch_arrivals_for_stop(stop_code, window_hours)
+
+        return {
+            "stop_code":      stop_code,
+            "stop_name":      stop_name,
+            "stop_city":      stop_city,
+            "stop_lat":       stop_lat,
+            "stop_lon":       stop_lon,
+            "stop_dist_km":   stop_dist_km,   # km from Tiberias centre
+            "arrivals":       arrivals,
+            "window_hours":   window_hours,
+            "server_time_il": now_il.strftime("%H:%M:%S"),
+            "server_date_il": now_il.strftime("%Y-%m-%d"),
+            "timestamp":      int(time.time()),
+        }
+
     except Exception as e:
-        return {"stop_code": stop_code, "arrivals": [], "error": str(e)}
+        logger.error("station-board exception: %s", e)
+        return {
+            "stop_code":      stop_code,
+            "arrivals":       [],
+            "error":          str(e),
+            "service_status": "unavailable",
+        }
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# /line-path  —  ordered stops along a route for map overlay
-# ──────────────────────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# /line-path  — ordered stop list for a route
+# ══════════════════════════════════════════════════════════════════════════════
 
 @router.get("/line-path")
 async def get_line_path(
@@ -361,18 +397,18 @@ async def get_line_path(
 ):
     try:
         async with httpx.AsyncClient(timeout=22.0) as client:
-            now = datetime.now(timezone.utc)
+            now       = _utcnow()
             time_from = (now - timedelta(hours=5)).strftime("%Y-%m-%dT%H:%M:%S+00:00")
             time_to   = now.strftime("%Y-%m-%dT%H:%M:%S+00:00")
 
             r1 = await client.get(
                 f"{BASE}/siri_ride_stops/list",
                 params={
-                    "siri_route__line_refs": line_ref,
+                    "siri_route__line_refs":                line_ref,
                     "siri_ride__scheduled_start_time_from": time_from,
                     "siri_ride__scheduled_start_time_to":   time_to,
                     "order_by": "order asc",
-                    "limit": 300,
+                    "limit":    300,
                 },
             )
             r1.raise_for_status()
@@ -433,9 +469,9 @@ async def get_line_path(
         return {"stops": [], "line_ref": line_ref, "count": 0, "error": str(e)}
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# /routes  —  active SIRI routes list
-# ──────────────────────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# /routes  — list SIRI routes
+# ══════════════════════════════════════════════════════════════════════════════
 
 @router.get("/routes")
 async def list_routes(
@@ -452,16 +488,3 @@ async def list_routes(
             return resp.json()
     except Exception as e:
         return {"error": str(e)}
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# helpers
-# ──────────────────────────────────────────────────────────────────────────────
-
-def _fmt_time(iso: str) -> str:
-    """Format an ISO timestamp as HH:MM in Asia/Jerusalem (Israel) local time."""
-    try:
-        dt = datetime.fromisoformat(iso.replace("Z", "+00:00"))
-        return dt.astimezone(IL_TZ).strftime("%H:%M")
-    except Exception:
-        return iso[-8:][:5] if len(iso) >= 8 else iso

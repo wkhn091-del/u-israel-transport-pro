@@ -41,7 +41,9 @@ def _load_creds() -> dict:
 async def get_token() -> str | None:
     """Return a valid access token, refreshing from the first responsive endpoint."""
     if _cache["token"] and time.time() < _cache["expires_at"] - 30:
+        print("[mot_auth] using cached token (still valid)")
         return _cache["token"]
+    print("[mot_auth] no cached token — probing endpoints...")
 
     creds = _load_creds()
     if "error" in creds:
@@ -77,6 +79,7 @@ async def get_token() -> str | None:
                 entry["status"] = r.status_code
                 entry["body_preview"] = r.text[:200]
 
+                print(f"[mot_auth] {url} → HTTP {r.status_code}  body={r.text[:120]}")
                 if r.status_code == 200:
                     try:
                         data = r.json()
@@ -86,6 +89,7 @@ async def get_token() -> str | None:
                             _cache["token"] = token
                             _cache["expires_at"] = time.time() + expires_in
                             entry["result"] = "OK — token obtained"
+                            print(f"[mot_auth] token obtained from {url}")
                             _last_probe.append(entry)
                             return token
                         else:

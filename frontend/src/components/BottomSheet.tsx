@@ -87,87 +87,13 @@ function fmt24(baseMs: number, plusMin: number): string {
   return d.toLocaleTimeString("he-IL", { hour: "2-digit", minute: "2-digit", hour12: false });
 }
 
-// Hebrew speed ETA ─────────────────────────────────────────────────────────────
+// Hebrew speed display ─────────────────────────────────────────────────────────
 function speedEta(kmh: number): string {
-  if (kmh <= 0) return "חי";
+  if (kmh <= 0) return "בתנועה";
   const min = Math.round(60 / kmh);
   if (min <= 1) return "כ-דקה";
   if (min > 60) return ">שעה";
   return `כ-${min} דק׳`;
-}
-
-// Deterministic departure offset based on string seed ─────────────────────────
-function seedOffset(s: string, base: number): number {
-  return base + s.split("").reduce((a, c) => a + c.charCodeAt(0), 0) % 8;
-}
-
-// ── Smart trip option builder ─────────────────────────────────────────────────
-interface TripOption {
-  mode: "bus" | "train" | "flight";
-  line: string;
-  operator: string;
-  mins: number;
-  direct: boolean;
-}
-
-const EILAT_KEYWORDS   = ["אילת", "eilat", "ovda", "עובדה"];
-const FLIGHT_AIRLINES  = ["ארקיע", "ישראייר", "אל-על"];
-
-function buildTripOptions(plan: TripPlan, vehicles: Vehicle[]): TripOption[] {
-  const distKm  = plan.distance_km || 100; // fallback if routing failed
-  const destLow = plan.destination.toLowerCase();
-  const toEilat = EILAT_KEYWORDS.some((k) => destLow.includes(k));
-  const isLong  = distKm > 200 || toEilat;
-  const isMed   = !isLong && distKm >= 40;
-
-  const opts: TripOption[] = [];
-  const now = Date.now();
-  void now; // used in callers via fmt24
-
-  // ── Bus options (always show up to 2) ──────────────────────────────────
-  const seenLines = new Set<string>();
-  let busOffset = 3;
-  for (const v of vehicles) {
-    if (v.type !== "bus" || !v.line_ref) continue;
-    const line = String(v.line_ref);
-    if (seenLines.has(line)) continue;
-    seenLines.add(line);
-    const op = OPERATOR_NAMES[v.operator as number] ?? "אוטובוס";
-    opts.push({ mode: "bus", line, operator: op, mins: seedOffset(line, busOffset), direct: !isLong });
-    busOffset += 12;
-    if (opts.filter((o) => o.mode === "bus").length >= 2) break;
-  }
-  // Fallback bus if no live data — use generic intercity, not a hardcoded line
-  if (opts.filter((o) => o.mode === "bus").length === 0) {
-    const genericLine = isMed ? "בינעירוני" : isLong ? "אקספרס" : "מקומי";
-    opts.push({ mode: "bus", line: genericLine, operator: "אגד", mins: 6, direct: !isLong });
-  }
-
-  // ── Train option (medium + long routes) ───────────────────────────────
-  if (isMed || isLong) {
-    const train = vehicles.find((v) => v.type === "train");
-    const trainLine = String(train?.train_number ?? "רכבת ישראל");
-    opts.push({
-      mode: "train", line: trainLine,
-      operator: "רכבת ישראל",
-      mins: seedOffset(trainLine, 8),
-      direct: true,
-    });
-  }
-
-  // ── Flight option (Eilat or very long routes) ─────────────────────────
-  if (isLong) {
-    const airlineIdx = (plan.destination.charCodeAt(0) ?? 65) % FLIGHT_AIRLINES.length;
-    opts.push({
-      mode: "flight",
-      line: toEilat ? "ETH" : "DOM",
-      operator: FLIGHT_AIRLINES[airlineIdx],
-      mins: toEilat ? 180 : seedOffset(plan.destination, 90),
-      direct: true,
-    });
-  }
-
-  return opts.sort((a, b) => a.mins - b.mins);
 }
 
 // ── Trip Plan card ────────────────────────────────────────────────────────────
@@ -721,7 +647,7 @@ export default function BottomSheet({
           {totalCount > 0 && (
             <div style={{ display: "flex", alignItems: "center", gap: 4, background: "#f0eeff", borderRadius: 999, padding: "2px 8px" }}>
               <Zap size={10} color="#7c3aed" />
-              <span style={{ fontSize: 11, fontWeight: 800, color: "#7c3aed" }}>חי</span>
+              <span style={{ fontSize: 11, fontWeight: 800, color: "#7c3aed" }}>עדכני</span>
             </div>
           )}
         </div>

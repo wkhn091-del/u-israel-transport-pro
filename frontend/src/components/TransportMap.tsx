@@ -40,8 +40,9 @@ type LeafletCircle   = { remove(): void; setLatLng(ll: [number, number]): void }
 type LeafletPolyline = { remove(): void; getBounds(): unknown };
 type LeafletMarker   = { remove(): void };
 
-const ISRAEL_CENTER: [number, number]  = [31.7683, 35.2137];
-const INITIAL_ZOOM    = 8;
+// ── TEST MODE: hard-coded to Tiberias for location-bound testing ──────────────
+const ISRAEL_CENTER: [number, number]  = [32.7922, 35.5312];  // Tiberias
+const INITIAL_ZOOM    = 15;  // tight view — only shows Tiberias buses
 const STOP_MIN_ZOOM   = 14;
 const LABEL_MIN_ZOOM  = 13;
 const GLIDE_MS        = 8000;
@@ -87,19 +88,22 @@ function drawVehicle(
   headingDeg: number,
   isSelected: boolean,
   now: number,
+  isLive: boolean = true,
 ) {
   const color = COLORS[type];
 
-  // ── Pulsing live ring ─────────────────────────────────────────────────────
-  const phase = (now % 2000) / 2000;
-  ctx.save();
-  ctx.globalAlpha = Math.max(0, 0.6 - phase * 0.6);
-  ctx.strokeStyle = color;
-  ctx.lineWidth = isSelected ? 3 : 2;
-  ctx.beginPath();
-  ctx.arc(x, y, 14 + phase * 18, 0, Math.PI * 2);
-  ctx.stroke();
-  ctx.restore();
+  // ── Pulsing live ring — only when GPS is fresh (< 5 min) ─────────────────
+  if (isLive) {
+    const phase = (now % 2000) / 2000;
+    ctx.save();
+    ctx.globalAlpha = Math.max(0, 0.6 - phase * 0.6);
+    ctx.strokeStyle = color;
+    ctx.lineWidth = isSelected ? 3 : 2;
+    ctx.beginPath();
+    ctx.arc(x, y, 14 + phase * 18, 0, Math.PI * 2);
+    ctx.stroke();
+    ctx.restore();
+  }
 
   // Outer glow for selected vehicle
   if (isSelected) {
@@ -322,9 +326,9 @@ export default function TransportMap({
     }
     const lineParam = lineFilterRef.current ? `&line_ref=${encodeURIComponent(lineFilterRef.current)}` : "";
     try {
-      const r = await fetch(
-        `http://localhost:8001/api/buses/live?lat_min=${south.toFixed(4)}&lat_max=${north.toFixed(4)}&lon_min=${west.toFixed(4)}&lon_max=${east.toFixed(4)}&limit=300${lineParam}`
-      );
+      const url = `http://localhost:8001/api/buses/live?lat_min=${south.toFixed(4)}&lat_max=${north.toFixed(4)}&lon_min=${west.toFixed(4)}&lon_max=${east.toFixed(4)}&limit=300${lineParam}`;
+      console.log("[fetchBuses] Fetching data from:", url);
+      const r = await fetch(url);
       const d = await r.json();
       const raw = (d.buses ?? []).map((b: Vehicle) => ({ ...b, type: "bus" as const }));
       return deduplicateBuses(raw);
@@ -651,41 +655,60 @@ export default function TransportMap({
         `http://localhost:8001/api/buses/station-board?stop_code=${stop.code}&window_hours=1`
       );
       const d = await r.json();
+
+      if (d.service_status === "unavailable") {
+        popup.setContent(
+          `<div dir="rtl" style="font-family:'Heebo',system-ui;padding:10px 4px;text-align:center;color:#b45309">` +
+          `<div style="font-size:13px;font-weight:700">שירות לא זמין כרגע</div>` +
+          `<div style="font-size:11px;color:#92400e;margin-top:3px">נסה שוב בקרוב</div></div>`
+        );
+        return;
+      }
+
       const arrivals: Array<{
-        route_short_name?: string;
-        line_ref?: string | number;
-        agency_name?: string;
-        scheduled_time?: string;
+        route_short_name?: string | null;
+        line_ref?: string | number | null;
+        agency_name?: string | null;
+        eta_display?: string;         // pre-formatted ETA from backend
+        aimed_display?: string;       // scheduled time "HH:MM" Israel TZ
+        eta_minutes?: number;
+        is_realtime?: boolean;
       }> = d.arrivals ?? [];
-      const now = Date.now();
 
-      const minsUntil = (iso: string): string => {
-        try {
-          const diff = Math.round((new Date(iso).getTime() - now) / 60_000);
-          if (diff <= 0) return "עכשיו";
-          if (diff === 1) return "בעוד דקה";
-          if (diff <= 10) return `בעוד ${diff} דקות`;
-          return `בעוד ${diff} דק׳`;
-        } catch { return "—"; }
-      };
-
-      // Use route_short_name (human-readable, e.g. "430") over raw line_ref (e.g. "7929")
-      const byLine = new Map<string, string>();
+      // Deduplicate by line, show up to 6 lines
+      const byLine = new Map<string, { eta: string; aimed: string; rt: boolean }>();
       for (const a of arrivals) {
         const line = String(a.route_short_name || a.line_ref || "");
         if (!line || byLine.has(line)) continue;
-        byLine.set(line, a.scheduled_time ? minsUntil(a.scheduled_time) : "—");
+        byLine.set(line, {
+          eta:   a.eta_display   || "—",
+          aimed: a.aimed_display || "—",
+          rt:    a.is_realtime   ?? false,
+        });
         if (byLine.size >= 6) break;
       }
 
+      const etaColor = (eta: string) => {
+        if (eta === "עבר")    return "#9ca3af";
+        if (eta === "מגיע")  return "#ef4444";
+        if (eta.startsWith("בעוד")) {
+          const m = parseInt(eta.replace(/\D/g, ""), 10);
+          if (m <= 5)  return "#f97316";
+          if (m <= 15) return "#eab308";
+        }
+        return "#7c3aed";
+      };
+
       const rows = byLine.size > 0
-        ? [...byLine.entries()].map(([line, eta]) =>
+        ? [...byLine.entries()].map(([line, info]) =>
             `<div style="display:flex;align-items:center;justify-content:space-between;padding:5px 0;border-bottom:1px solid #f3f4f6">` +
             `<div style="display:flex;align-items:center;gap:7px">` +
-            `<div style="width:30px;height:30px;background:#16a34a;border-radius:7px;display:flex;align-items:center;justify-content:center;color:#fff;font-weight:900;font-size:${line.length > 3 ? 9 : 11}px">${line}</div>` +
-            `<span style="font-weight:700;color:#1e1b4b;font-size:12px">קו ${line}</span>` +
-            `</div>` +
-            `<span style="color:#7c3aed;font-weight:700;font-size:11px;white-space:nowrap">${eta}</span>` +
+            `<div style="min-width:30px;height:30px;padding:0 4px;background:#16a34a;border-radius:7px;display:flex;align-items:center;justify-content:center;color:#fff;font-weight:900;font-size:${line.length > 3 ? 9 : 11}px">${line}</div>` +
+            `<div>` +
+            `<div style="font-weight:700;color:#1e1b4b;font-size:12px">קו ${line}</div>` +
+            `<div style="color:#9ca3af;font-size:10px">${info.aimed}${info.rt ? " 📡" : ""}</div>` +
+            `</div></div>` +
+            `<span style="color:${etaColor(info.eta)};font-weight:700;font-size:11px;white-space:nowrap">${info.eta}</span>` +
             `</div>`
           ).join("")
         : `<div style="color:#9ca3af;font-size:12px;text-align:center;padding:10px 0">אין יציאות בשעה הקרובה</div>`;
@@ -837,7 +860,8 @@ export default function TransportMap({
         try {
           const pt = lmap.latLngToContainerPoint([lat, lon]);
           const heading = (v.heading as number | undefined) ?? (v.bearing as number | undefined) ?? 0;
-          drawVehicle(ctx, pt.x, pt.y, v.type, heading, sel?.id === v.id, now);
+          const isLive  = v.is_live !== false; // trains/flights always live; buses use is_live flag
+          drawVehicle(ctx, pt.x, pt.y, v.type, heading, sel?.id === v.id, now, isLive);
           if (zoom >= LABEL_MIN_ZOOM) drawLabel(ctx, pt.x, pt.y, v);
         } catch { /* skip off-map */ }
       }
@@ -1040,10 +1064,10 @@ export default function TransportMap({
           <span style={{ fontSize: 18 }}>🚌</span>
           <div>
             <div style={{ fontSize: 13, fontWeight: 800, color: "#b45309" }}>
-              השירות זמנית אינו זמין
+              שירות לא זמין כרגע
             </div>
             <div style={{ fontSize: 11, color: "#92400e", marginTop: 2 }}>
-              Service Temporarily Unavailable · נסה שוב בקרוב
+              נסה שוב בקרוב
             </div>
           </div>
         </div>
