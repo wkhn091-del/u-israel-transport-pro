@@ -1,0 +1,171 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --font-heebo: 'Heebo', system-ui, -apple-system, sans-serif;
+  --purple:       #7c3aed;
+  --purple-light: #a78bfa;
+  --purple-bg:    #f5f3ff;
+  --train:        #2563eb;
+  --bus:          #16a34a;
+  --flight:       #d97706;
+  --text-dark:    #1e1b4b;
+  --text-mid:     #6b7280;
+  --text-soft:    #9ca3af;
+  --border-soft:  #e5e7eb;
+  --border-purple:#ddd6fe;
+}
+
+/* ── Hard resets ────────────────────────────────────────────────────────────── */
+*, *::before, *::after {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+html, body {
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+  background: #f5f3ff;
+}
+
+body {
+  font-family: var(--font-heebo);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  color: var(--text-dark);
+}
+
+/* Next.js app router root */
+body > div:first-child,
+body > main {
+  height: 100%;
+  width: 100%;
+}
+
+/* ── Scrollbars ─────────────────────────────────────────────────────────────── */
+::-webkit-scrollbar { width: 4px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: #ddd6fe; border-radius: 4px; }
+
+/* ── Leaflet overrides — light Moovit style ─────────────────────────────────── */
+.leaflet-container {
+  background: #e8e4f8 !important;
+  font-family: var(--font-heebo) !important;
+  pointer-events: auto !important;
+  touch-action: pan-x pan-y !important;
+  cursor: grab !important;
+  user-select: none !important;
+}
+.leaflet-container.leaflet-drag-target { cursor: grabbing !important; }
+
+/* Leaflet pane z-index stack — keep below app UI overlays (z ≥ 500) */
+.leaflet-tile-pane     { z-index: 2 !important; }
+.leaflet-overlay-pane  { z-index: 4 !important; }
+.leaflet-shadow-pane   { z-index: 5 !important; }
+.leaflet-marker-pane   { z-index: 6 !important; }
+.leaflet-tooltip-pane  { z-index: 7 !important; }
+.leaflet-popup-pane    { z-index: 8 !important; }
+.leaflet-control-container { z-index: 400 !important; }
+
+/* Zoom controls */
+.leaflet-control-zoom {
+  border: none !important;
+  box-shadow: 0 2px 16px rgba(0,0,0,0.10) !important;
+  border-radius: 14px !important;
+  overflow: hidden;
+}
+.leaflet-control-zoom a {
+  background: #ffffff !important;
+  color: #1e1b4b !important;
+  border: none !important;
+  border-bottom: 1px solid #f0eeff !important;
+  font-weight: 700 !important;
+  font-size: 16px !important;
+  line-height: 30px !important;
+  width: 34px !important;
+  height: 34px !important;
+}
+.leaflet-control-zoom a:last-child { border-bottom: none !important; }
+.leaflet-control-zoom a:hover { background: #f5f3ff !important; color: #7c3aed !important; }
+
+/* Attribution */
+.leaflet-control-attribution {
+  background: rgba(255,255,255,0.80) !important;
+  color: #c4b5fd !important;
+  font-size: 9px !important;
+  border-radius: 8px 0 0 0 !important;
+  padding: 2px 6px !important;
+  backdrop-filter: blur(4px) !important;
+}
+.leaflet-control-attribution a { color: #a78bfa !important; }
+
+/* ── Stop markers ───────────────────────────────────────────────────────────── */
+.stop-marker {
+  transition: none !important;
+  animation: stop-pulse 2.4s ease-in-out infinite !important;
+}
+@keyframes stop-pulse {
+  0%, 100% { filter: drop-shadow(0 0 4px rgba(124,58,237,0.50)); }
+  50%       { filter: drop-shadow(0 0 10px rgba(124,58,237,0.90)); }
+}
+
+/* ── Stop tooltip ───────────────────────────────────────────────────────────── */
+.stop-tooltip {
+  background: #ffffff !important;
+  border: 1.5px solid #7c3aed !important;
+  border-radius: 14px !important;
+  color: #1e1b4b !important;
+  font-family: var(--font-heebo) !important;
+  font-size: 12px !important;
+  font-weight: 600 !important;
+  padding: 8px 14px !important;
+  box-shadow: 0 6px 28px rgba(124,58,237,0.22) !important;
+  direction: rtl !important;
+  text-align: right !important;
+  max-width: 200px !important;
+}
+.stop-tooltip::before { border-top-color: #7c3aed !important; }
+
+/* ── Animations ─────────────────────────────────────────────────────────────── */
+@keyframes ping-ring {
+  0%   { transform: scale(1);   opacity: .6; }
+  70%  { transform: scale(1.8); opacity: 0;  }
+  100% { transform: scale(1.8); opacity: 0;  }
+}
+.marker-delayed .ring { animation: ping-ring 1.4s ease-out infinite; }
+
+@keyframes sheet-rise {
+  from { transform: translateY(100%); }
+  to   { transform: translateY(0); }
+}
+
+@keyframes fade-up {
+  from { opacity: 0; transform: translateY(8px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
+/* ── Inputs ─────────────────────────────────────────────────────────────────── */
+input:-webkit-autofill,
+input:-webkit-autofill:hover,
+input:-webkit-autofill:focus {
+  -webkit-box-shadow: 0 0 0px 1000px #ffffff inset !important;
+  -webkit-text-fill-color: #1e1b4b !important;
+  caret-color: #7c3aed;
+}
+
+/* ── Bottom sheet ───────────────────────────────────────────────────────────── */
+.bottom-sheet-scroll {
+  -webkit-overflow-scrolling: touch;
+  overscroll-behavior: contain;
+}
+
+/* ── Map full-bleed ─────────────────────────────────────────────────────────── */
+.map-root,
+.map-root > div,
+.leaflet-container {
+  width: 100% !important;
+  height: 100% !important;
+}
