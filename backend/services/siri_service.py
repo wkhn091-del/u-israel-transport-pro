@@ -14,6 +14,7 @@ If both sources return nothing, we return [].
 """
 import logging
 import math
+import re
 import xml.etree.ElementTree as ET
 import pytz
 from datetime import datetime, timezone, timedelta
@@ -88,12 +89,16 @@ def arrival_display(
     """
     Return (display_string, display_type).
 
-    DATE ANCHOR RULE: which calendar day the bus runs is ALWAYS decided by
-    aimed_arrival_time in Israel local time.  A stale expected_arrival_time
-    that happens to be "2 minutes from now" cannot override this.
+    - aimed_utc:    The GTFS-scheduled arrival time for this specific stop.
+    - expected_utc: Real-time prediction from SIRI (may be None for GTFS-only data).
 
-    expected_arrival_time is trusted for the countdown only if its drift from
-    aimed_arrival_time is ≤ 60 minutes (sanity check for stale SIRI data).
+    DATE ANCHOR: which calendar day the bus belongs to is decided by aimed_utc
+    in Israel local time.  expected_utc is only trusted if it drifts ≤ 20 min
+    from aimed_utc (buses are never 20+ min early/late on SIRI feeds).
+
+    Countdown is shown for any bus arriving within 30 min — real-time OR scheduled.
+    display_type "realtime" means SIRI expected_utc was used; "scheduled" means GTFS only.
+    The Live badge in the UI must only appear when display_type == "realtime".
     """
     if aimed_utc is None:
         return "—", "scheduled"
@@ -101,42 +106,48 @@ def arrival_display(
     now_il   = now_utc.astimezone(IL_TZ)
     aimed_il = aimed_utc.astimezone(IL_TZ)
 
-    # ── DATE ANCHOR ────────────────────────────────────────────────────────────
+    # ── DATE ANCHOR ─────────────────────────────────────────────────────────────
     if aimed_il.date() < now_il.date():
-        return "עבר", "departed"      # yesterday's ride leaked through
+        return "עבר", "departed"
 
     if aimed_il.date() > now_il.date():
-        # Priority 3: bus runs tomorrow in Israel local calendar
         return f"מחר ב-{aimed_il.strftime('%H:%M')}", "next_day"
 
-    # ── Today's bus — validate expected_arrival_time ───────────────────────────
+    # ── Validate expected_arrival_time (SIRI real-time) ──────────────────────────
+    # Only trust it if drift from scheduled is ≤ 20 minutes.
+    # A larger drift means the SIRI field is stale data from a previous trip.
     eta_utc        = aimed_utc
     using_realtime = False
     if expected_utc is not None:
         drift_sec = abs((expected_utc - aimed_utc).total_seconds())
-        if drift_sec <= 3600:          # ≤ 60 min drift → believable
+        if drift_sec <= 1200:          # ≤ 20 min drift → believable real-time
             eta_utc        = expected_utc
             using_realtime = True
         else:
-            logger.warning(
-                "Ignored stale expected_arrival_time "
-                "(drift %.1f min): aimed=%s  expected=%s",
-                drift_sec / 60, _fmt_il(aimed_utc), _fmt_il(expected_utc),
+            print(
+                f"[arrival_display] REJECTED stale expected (drift {drift_sec/60:.1f} min): "
+                f"aimed={_fmt_il(aimed_utc)}  expected={_fmt_il(expected_utc)}"
             )
 
-    # ── EXACT SUBTRACTION: now_utc from eta_utc ───────────────────────────────
-    mins = int((eta_utc - now_utc).total_seconds() / 60)   # ← THE LINE
+    # ── EXACT TIME DIFFERENCE: datetime.now(UTC) − eta_utc ─────────────────────
+    mins = int((eta_utc - now_utc).total_seconds() / 60)
+    print(
+        f"[arrival_display] now_il={_fmt_il(now_utc)}  eta_il={_fmt_il(eta_utc)}"
+        f"  mins={mins}  has_realtime={using_realtime}"
+    )
 
     if mins < 0:
         return "עבר", "departed"
     if mins == 0:
         return "מגיע", "realtime" if using_realtime else "scheduled"
 
-    # Priority 1: real-time, arrives in < 30 min
+    # Countdown ONLY when SIRI expected_arrival_time is present and valid.
+    # GTFS-only data (no expected_utc) → always show the scheduled clock time.
     if using_realtime and mins < 30:
-        return ("בעוד דקה" if mins == 1 else f"בעוד {mins} דקות"), "realtime"
+        label = "בעוד דקה" if mins == 1 else f"בעוד {mins} דקות"
+        return label, "realtime"
 
-    # Priority 2: no valid real-time, or ≥ 30 min — planned clock time
+    # No real-time data or >= 30 min → exact scheduled time
     return f"מתוכנן ל-{eta_utc.astimezone(IL_TZ).strftime('%H:%M')}", "scheduled"
 
 
@@ -298,8 +309,33 @@ async def _fetch_mot_stop_monitoring(
 # SOURCE 2 — Hasadna Open Bus Stride  (public fallback)
 # ══════════════════════════════════════════════════════════════════════════════
 
-# in-process cache: (line_ref, operator_ref) → (route_short_name, agency_name)
-_rsn_cache: dict[tuple, tuple[str, str]] = {}
+# in-process cache: (line_ref, operator_ref) → (route_short_name, agency_name, destination_name)
+_rsn_cache: dict[tuple, tuple[str, str, str]] = {}
+
+
+def _extract_dest(long_name: str, direction: str) -> str:
+    """
+    Parse a human-readable destination from a GTFS route_long_name.
+
+    GTFS long names look like:
+      "ת. מרכזית טבריה/רציפים-טבריה<->הנשיא וייצמן/המברג-טבריה-10"
+    Split on "<->":  part[0] = first terminus, part[1] = second terminus.
+    direction "2" → bus runs from part[1] to part[0], so destination = part[0].
+    Otherwise (direction "1" or unknown) → destination = part[1].
+    Strip trailing "-<digits>" suffixes and everything after "/" to keep it short.
+    """
+    if not long_name:
+        return ""
+    parts = long_name.split("<->")
+    if len(parts) == 2:
+        raw = parts[0].strip() if direction == "2" else parts[1].strip()
+    else:
+        raw = parts[0].strip()
+    raw = re.sub(r"-\d+$", "", raw).strip()      # drop route-number suffix "-10"
+    raw = re.sub(r"-[^-/]+$", "", raw).strip()   # drop city suffix "-כרמיאל"
+    if "/" in raw:
+        raw = raw.split("/")[0].strip()           # keep station name, drop street
+    return raw[:22]                               # cap at 22 chars
 
 
 async def _fill_route_names(pairs: list[tuple], client: httpx.AsyncClient) -> None:
@@ -319,12 +355,15 @@ async def _fill_route_names(pairs: list[tuple], client: httpx.AsyncClient) -> No
         resp = await client.get(url, params=params, timeout=12.0)
         logger.info("SIRI Response Status: %s  (gtfs_routes)", resp.status_code)
         for row in (resp.json() if resp.status_code == 200 else []):
-            lr  = row.get("line_ref")
-            op  = row.get("operator_ref")
-            rsn = row.get("route_short_name") or ""
-            agency = row.get("agency_name") or ""
+            lr        = row.get("line_ref")
+            op        = row.get("operator_ref")
+            rsn       = row.get("route_short_name") or ""
+            agency    = row.get("agency_name") or ""
+            long_name = row.get("route_long_name") or ""
+            direction = str(row.get("route_direction") or "1")
             if lr is not None and op is not None and rsn:
-                _rsn_cache[(int(lr), int(op))] = (str(rsn), str(agency))
+                dest = _extract_dest(long_name, direction)
+                _rsn_cache[(int(lr), int(op))] = (str(rsn), str(agency), dest)
     except Exception as exc:
         logger.error("gtfs_routes fetch error: %s", exc)
 
@@ -336,119 +375,96 @@ async def _fetch_hasadna_stop_monitoring(
     now_utc: datetime,
 ) -> list[dict]:
     """
-    Fetch arrivals for stop_code from the Hasadna Open Bus Stride API.
-    This is a public REST proxy of the same Israeli MOT SIRI/GTFS data.
+    Fetch scheduled arrivals for stop_code using the Hasadna GTFS ride-stops endpoint.
+
+    Uses /gtfs_ride_stops/list which provides real per-stop arrival_time from GTFS.
+    The old /siri_ride_stops/list endpoint had no per-stop timing — all aimed/expected
+    fields were null — causing the fallback to ride start time ("fake 2 min" bug).
+
+    Returns [] if the API is unreachable or the stop has no scheduled arrivals.
+    No invented data is ever returned.
     """
-    # Step 1 — stop code → SIRI stop IDs
-    url1 = f"{HASADNA_BASE}/siri_stops/list"
-    logger.info("Fetching data from: %s  params={codes: %s}", url1, stop_code)
-    r1 = await client.get(url1, params={"codes": stop_code, "limit": 5}, timeout=8.0)
-    logger.info("SIRI Response Status: %s  (siri_stops)", r1.status_code)
+    now_il = now_utc.astimezone(IL_TZ)
 
-    siri_stops = r1.json() if r1.status_code == 200 else []
-    if not isinstance(siri_stops, list) or not siri_stops or not siri_stops[0].get("id"):
-        logger.warning("Stop %s not found in Hasadna SIRI database", stop_code)
-        return []
+    # Query window: a small buffer before now so arriving buses aren't missed,
+    # plus window_hours ahead.  Times must include the timezone offset (+03:00 / +02:00).
+    time_from = (now_il - timedelta(minutes=2)).isoformat(timespec="seconds")
+    time_to   = (now_il + timedelta(hours=window_hours)).isoformat(timespec="seconds")
 
-    siri_stop_ids = [str(s["id"]) for s in siri_stops[:3]]
-    logger.info("Resolved stop %s → SIRI IDs %s", stop_code, siri_stop_ids)
-
-    # Step 2 — ride-stops for this stop
-    query_from = (now_utc - timedelta(hours=2)).strftime("%Y-%m-%dT%H:%M:%S+00:00")
-    query_to   = (now_utc + timedelta(hours=window_hours)).strftime("%Y-%m-%dT%H:%M:%S+00:00")
-    params2 = {
-        "siri_stop_ids":                         ",".join(siri_stop_ids),
-        "siri_ride__scheduled_start_time_from":  query_from,
-        "siri_ride__scheduled_start_time_to":    query_to,
-        "limit":    60,
-        "order_by": "aimed_arrival_time asc",
+    url = f"{HASADNA_BASE}/gtfs_ride_stops/list"
+    params = {
+        "gtfs_stop__code":   stop_code,
+        "arrival_time_from": time_from,
+        "arrival_time_to":   time_to,
+        "limit":             60,
+        "order_by":          "arrival_time asc",
     }
-    url2 = f"{HASADNA_BASE}/siri_ride_stops/list"
-    logger.info("Fetching data from: %s  params=%s", url2, params2)
-    r2 = await client.get(url2, params=params2, timeout=12.0)
-    logger.info("SIRI Response Status: %s  (siri_ride_stops, %d records)",
-                r2.status_code,
-                len(r2.json()) if r2.status_code == 200 and isinstance(r2.json(), list) else 0)
 
-    rides = r2.json() if r2.status_code == 200 else []
-    if not isinstance(rides, list):
-        logger.error("Hasadna siri_ride_stops returned non-list: %s", rides)
+    print(f"[siri_service] DEBUG: now_il={now_il.strftime('%Y-%m-%d %H:%M:%S %Z')}")
+    print(f"[siri_service] GET {url}  params={params}")
+
+    try:
+        r = await client.get(url, params=params, timeout=12.0)
+    except Exception as exc:
+        logger.error("gtfs_ride_stops request failed: %s", exc)
         return []
 
-    # Log first 3 raw records so operator can verify fields
-    for i, ride in enumerate(rides[:3]):
-        logger.info(
-            "raw ride[%d]: line=%s  aimed=%s  expected=%s  actual=%s",
-            i,
-            ride.get("siri_route__line_ref"),
-            ride.get("aimed_arrival_time"),
-            ride.get("expected_arrival_time"),
-            ride.get("actual_arrival_time"),
+    print(f"[siri_service] Response status={r.status_code}")
+
+    if r.status_code != 200:
+        logger.error("gtfs_ride_stops HTTP %s: %s", r.status_code, r.text[:300])
+        return []
+
+    rows = r.json()
+    if not isinstance(rows, list):
+        logger.error("gtfs_ride_stops returned non-list: %s", str(rows)[:200])
+        return []
+
+    print(f"[siri_service] {len(rows)} raw rows from gtfs_ride_stops")
+
+    # Log first 3 raw rows for verification
+    for i, row in enumerate(rows[:3]):
+        print(
+            f"[siri_service] raw[{i}]: line={row.get('gtfs_route__route_short_name')}"
+            f"  arrival_time={row.get('arrival_time')}"
+            f"  stop_code={row.get('gtfs_stop__code')}"
+            f"  city={row.get('gtfs_stop__city')}"
         )
 
-    # Step 3 — resolve route names
-    pairs = [
-        (int(r["siri_route__line_ref"]), int(r["siri_route__operator_ref"]))
-        for r in rides
-        if r.get("siri_route__line_ref") and r.get("siri_route__operator_ref")
-    ]
-    if pairs:
-        await _fill_route_names(pairs, client)
-
-    # Step 4 — build arrival list
     arrivals: list[dict] = []
-    seen: set[str] = set()
+    seen_journey: set[str] = set()
 
-    for ride in rides:
-        ride_key = f"{ride.get('siri_ride__id')}_{ride.get('siri_stop__id')}"
-        if ride_key in seen:
+    for row in rows:
+        # Each row is one stop in one GTFS trip — deduplicate by journey_ref
+        jref = row.get("gtfs_ride__journey_ref") or str(row.get("gtfs_ride_id", ""))
+        if jref in seen_journey:
             continue
-        seen.add(ride_key)
+        seen_journey.add(jref)
 
-        # Skip if bus already departed this stop
-        if _parse_iso(ride.get("actual_arrival_time")) is not None:
-            continue
-
-        # Stop-specific scheduled arrival (aimed > departure > ride start as fallback)
-        aimed_at = (
-            _parse_iso(ride.get("aimed_arrival_time"))
-            or _parse_iso(ride.get("aimed_departure_time"))
-            or _parse_iso(ride.get("siri_ride__scheduled_start_time"))
-        )
+        # arrival_time is the GTFS-scheduled arrival at this specific stop (UTC ISO)
+        aimed_at = _parse_iso(row.get("arrival_time") or row.get("departure_time"))
         if aimed_at is None:
+            print(f"[siri_service] SKIP row {row.get('id')}: no arrival_time")
             continue
 
-        # Drop if more than 2 minutes in the past
+        # Drop if more than 2 min in the past (bus already left)
         if aimed_at < (now_utc - timedelta(minutes=2)):
+            print(f"[siri_service] SKIP past arrival: {_fmt_il(aimed_at)} (now={_fmt_il(now_utc)})")
             continue
 
-        expected_at = _parse_iso(ride.get("expected_arrival_time"))
-
-        # Three-priority display (with date anchor on aimed_at)
-        display_str, display_type = arrival_display(aimed_at, expected_at, now_utc)
+        # No expected_arrival_time from GTFS — schedule only, no real-time
+        display_str, display_type = arrival_display(aimed_at, None, now_utc)
         if display_type == "departed":
             continue
 
-        # ETA minutes — use expected only if sane (within 60 min)
-        if expected_at and abs((expected_at - aimed_at).total_seconds()) <= 3600:
-            eta_ref = expected_at
-        else:
-            eta_ref = aimed_at
-        eta_min = int((eta_ref - now_utc).total_seconds() / 60)
+        eta_min = int((aimed_at - now_utc).total_seconds() / 60)
 
-        lr  = ride.get("siri_route__line_ref")
-        op  = ride.get("siri_route__operator_ref")
-        rsn, agency = _rsn_cache.get(
-            (int(lr), int(op)) if lr is not None and op is not None else (-1, -1),
-            ("", ""),
-        )
+        rsn    = row.get("gtfs_route__route_short_name") or ""
+        agency = row.get("gtfs_route__agency_name") or ""
+        lr     = row.get("gtfs_route__line_ref")
+        op     = row.get("gtfs_route__operator_ref")
 
-        logger.info(
-            "  → line=%-6s aimed_il=%s  expected=%s  display='%s'  type=%s  eta_min=%d",
-            rsn or lr, _fmt_il(aimed_at),
-            "—" if expected_at is None else _fmt_il(expected_at),
-            display_str, display_type, eta_min,
-        )
+        print(f">>> STATION {stop_code}: Line {rsn or lr} arriving at {display_str} (LIVE: False)")
 
         arrivals.append({
             "line_ref":          lr,
@@ -457,15 +473,16 @@ async def _fetch_hasadna_stop_monitoring(
             "operator":          op,
             "aimed_time":        _ts(aimed_at),
             "aimed_display":     _fmt_il(aimed_at),
-            "eta_time":          _ts(eta_ref),
+            "eta_time":          _ts(aimed_at),
             "eta_display":       display_str,
             "display_type":      display_type,
             "eta_minutes":       eta_min,
-            "is_realtime":       display_type == "realtime",
-            "vehicle_ref":       ride.get("siri_ride__vehicle_ref"),
+            "is_realtime":       False,   # GTFS = schedule only; no Live badge
+            "vehicle_ref":       row.get("siri_ride__vehicle_ref"),
             "scheduled_time":    _ts(aimed_at),
             "scheduled_display": _fmt_il(aimed_at),
-            "source":            "hasadna_siri",
+            "source":            "hasadna_gtfs",
+            "stop_code":         stop_code,
         })
 
     return arrivals
@@ -497,6 +514,8 @@ async def fetch_arrivals_for_stop(
         mot_arrivals = await _fetch_mot_stop_monitoring(stop_code, client, now_utc)
         if mot_arrivals is not None:
             logger.info("Using MOT SIRI data (%d arrivals)", len(mot_arrivals))
+            for a in mot_arrivals:
+                a.setdefault("stop_code", stop_code)
             mot_arrivals.sort(key=lambda a: a["eta_minutes"])
             return mot_arrivals
 
@@ -504,11 +523,43 @@ async def fetch_arrivals_for_stop(
         logger.info("Falling back to Hasadna Open Bus Stride API")
         arrivals = await _fetch_hasadna_stop_monitoring(stop_code, window_hours, client, now_utc)
 
+        # Resolve destination names while client is still open
+        if arrivals:
+            pairs = list({
+                (int(a["line_ref"]), int(a["operator"]))
+                for a in arrivals
+                if a.get("line_ref") is not None and a.get("operator") is not None
+            })
+            if pairs:
+                await _fill_route_names(pairs, client)
+            for a in arrivals:
+                lr = a.get("line_ref")
+                op = a.get("operator")
+                if lr is not None and op is not None:
+                    _, _, dest = _rsn_cache.get((int(lr), int(op)), ("", "", ""))
+                    if dest:
+                        a.setdefault("destination", dest)
+
     arrivals.sort(key=lambda a: a["eta_minutes"])
     logger.info(
-        "fetch_arrivals_for_stop done: %d arrivals  (source=hasadna_siri)", len(arrivals)
+        "fetch_arrivals_for_stop done: %d arrivals  stop=%d", len(arrivals), stop_code
     )
     return arrivals
+
+
+async def get_realtime_buses(limit: int = 200) -> list[dict]:
+    """
+    Strict public interface: fetch live buses within TIBERIAS_RADIUS_KM of Tiberias.
+    Calls ONLY the Hasadna SIRI API. Returns [] on any failure — no fallback data.
+    """
+    return await fetch_live_vehicles(
+        lat_min=TIBERIAS_LAT - 0.018,
+        lat_max=TIBERIAS_LAT + 0.018,
+        lon_min=TIBERIAS_LON - 0.0215,
+        lon_max=TIBERIAS_LON + 0.0215,
+        radius_km=TIBERIAS_RADIUS_KM,
+        limit=limit,
+    )
 
 
 async def fetch_live_vehicles(
@@ -526,9 +577,15 @@ async def fetch_live_vehicles(
     now_il       = now_utc.astimezone(IL_TZ)
     ghost_cutoff = now_utc - timedelta(minutes=10)
     live_cutoff  = now_utc - timedelta(minutes=5)
-    center_lat   = (lat_min + lat_max) / 2
-    center_lon   = (lon_min + lon_max) / 2
     time_from    = (now_utc - timedelta(minutes=15)).strftime("%Y-%m-%dT%H:%M:%S+00:00")
+
+    # ── LOCATION FILTER: always pin to Tiberias centre + 2 km ─────────────────
+    # The frontend may send a wide viewport bbox (full-Israel) when not in focus
+    # mode.  Pinning to TIBERIAS_LAT/LON + TIBERIAS_RADIUS_KM ensures we NEVER
+    # return buses from Haifa, Tel Aviv, etc. regardless of the frontend bbox.
+    FILTER_LAT = TIBERIAS_LAT        # 32.7922
+    FILTER_LON = TIBERIAS_LON        # 35.5312
+    FILTER_KM  = TIBERIAS_RADIUS_KM  # 2.0
 
     url = f"{HASADNA_BASE}/siri_vehicle_locations/list"
     params = {
@@ -536,23 +593,21 @@ async def fetch_live_vehicles(
         "order_by":              "id desc",
         "recorded_at_time_from": time_from,
     }
-    logger.info(
-        "=== fetch_live_vehicles  %s ===", now_il.strftime("%Y-%m-%d %H:%M:%S %Z")
-    )
-    logger.info("Fetching data from: %s  params=%s", url, params)
+    print(f"[fetch_live_vehicles] {now_il.strftime('%H:%M:%S %Z')}  "
+          f"filter=Tiberias {FILTER_LAT},{FILTER_LON} radius={FILTER_KM}km")
+    print(f"[fetch_live_vehicles] GET {url}  params={params}")
 
     try:
         async with httpx.AsyncClient(timeout=30.0) as client:
             resp = await client.get(url, params=params, timeout=15.0)
-            logger.info("SIRI Response Status: %s  (%d raw records)",
-                        resp.status_code,
-                        len(resp.json()) if resp.status_code == 200 else 0)
+            raw_count = len(resp.json()) if resp.status_code == 200 else 0
+            print(f"[fetch_live_vehicles] Response status={resp.status_code}  raw_records={raw_count}")
             resp.raise_for_status()
             raw_items = resp.json()
 
             buses: list[dict] = []
             seen_vrefs: set[str] = set()
-            dropped: dict[str, int] = {"bbox": 0, "radius": 0, "ghost": 0}
+            dropped: dict[str, int] = {"radius": 0, "ghost": 0, "dup": 0}
 
             for item in raw_items:
                 lat = item.get("lat")
@@ -560,18 +615,13 @@ async def fetch_live_vehicles(
                 if lat is None or lon is None:
                     continue
 
-                # Bbox pre-filter
-                if not (lat_min <= lat <= lat_max and lon_min <= lon <= lon_max):
-                    dropped["bbox"] += 1
-                    continue
-
-                # Haversine radius filter
-                dist_km = haversine_km(center_lat, center_lon, lat, lon)
-                if dist_km > radius_km:
+                # Haversine radius filter — always against Tiberias centre
+                dist_km = haversine_km(FILTER_LAT, FILTER_LON, lat, lon)
+                if dist_km > FILTER_KM:
                     dropped["radius"] += 1
                     continue
 
-                # Ghost-bus filter
+                # Ghost-bus filter: GPS > 10 min old → drop entirely
                 recorded_at = _parse_iso(item.get("recorded_at_time"))
                 if recorded_at is None or recorded_at < ghost_cutoff:
                     dropped["ghost"] += 1
@@ -583,6 +633,7 @@ async def fetch_live_vehicles(
 
                 if vref:
                     if vref in seen_vrefs:
+                        dropped["dup"] += 1
                         continue
                     seen_vrefs.add(vref)
 
@@ -590,6 +641,7 @@ async def fetch_live_vehicles(
                     break
 
                 is_live = recorded_at >= live_cutoff
+                rsn = str(lr) if lr is not None else "?"
                 buses.append({
                     "id":               f"bus_{item['id']}",
                     "lat":              lat,
@@ -604,22 +656,17 @@ async def fetch_live_vehicles(
                     "dist_km":          round(dist_km, 2),
                     "source":           "hasadna_siri",
                     "type":             "bus",
-                    "route_short_name": str(lr) if lr is not None else "?",
+                    "route_short_name": rsn,
                     "operator":         op,
                     "agency_name":      "",
+                    "destination_name": "",   # resolved below after route lookup
                     "is_live":          is_live,
                 })
+                print(f">>> REAL-TIME VALIDATION: Found {rsn} at {lat}/{lon}. "
+                      f"Distance from User: {round(dist_km, 2)}km")
 
-            logger.info(
-                "fetch_live_vehicles result: %d buses | dropped bbox=%d radius=%d ghost=%d",
-                len(buses), dropped["bbox"], dropped["radius"], dropped["ghost"],
-            )
-            for b in buses:
-                logger.info(
-                    "  bus line=%-6s lat=%.4f lon=%.4f dist=%.2f km is_live=%s recorded=%s",
-                    b["route_short_name"], b["lat"], b["lon"],
-                    b["dist_km"], b["is_live"], b["recorded_at"],
-                )
+            print(f"[fetch_live_vehicles] kept={len(buses)}  "
+                  f"dropped radius={dropped['radius']} ghost={dropped['ghost']} dup={dropped['dup']}")
 
             # Resolve route_short_name
             if buses:
@@ -634,10 +681,12 @@ async def fetch_live_vehicles(
                     lr = b["line_ref"]
                     op = b["operator_ref"]
                     if lr is not None and op is not None:
-                        rsn, agency = _rsn_cache.get((int(lr), int(op)), ("", ""))
+                        rsn, agency, dest = _rsn_cache.get((int(lr), int(op)), ("", "", ""))
                         if rsn:
                             b["route_short_name"] = rsn
                             b["agency_name"]      = agency
+                            b["destination_name"] = dest
+                            print(f"Sending bus {rsn} to {dest!r} to frontend")
 
             return buses
 

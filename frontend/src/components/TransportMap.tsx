@@ -159,47 +159,62 @@ function drawVehicle(
 }
 
 function drawLabel(ctx: CanvasRenderingContext2D, x: number, y: number, vehicle: Vehicle) {
-  let primary = "";
-  let secondary = "";
-  const color = COLORS[vehicle.type];
+  // ── Build the label text ──────────────────────────────────────────────────
+  let text = "";
 
   if (vehicle.type === "bus") {
-    // Prefer the human-readable route_short_name (e.g. "430") over the raw
-    // internal SIRI line_ref (e.g. "7929") that the backend also returns.
-    const short = vehicle.route_short_name as string | undefined;
-    const lr    = vehicle.line_ref as number | string | undefined;
-    const label = short || (lr != null ? String(lr) : null);
-    if (!label) return;
-    primary = label;
+    const rsn  = (vehicle.route_short_name as string | undefined) ?? "";
+    const lr   = vehicle.line_ref as number | string | undefined;
+    const line = rsn || (lr != null ? String(lr) : "");
+    if (!line) return;
+    const dest = (vehicle.destination_name as string | undefined) ?? "";
+    // Format: "15 — לטבריה עילית"  or just "15" when destination is unknown
+    text = dest ? `${line} — ${dest}` : line;
   } else if (vehicle.type === "train") {
-    primary = String((vehicle.train_number as string | undefined) ?? "");
+    const num = String((vehicle.train_number as string | undefined) ?? "");
+    if (!num) return;
     const dst = (vehicle.destination as string | undefined) ?? "";
-    secondary = dst.length > 7 ? dst.slice(0, 6) + "…" : dst;
+    const short = dst.length > 8 ? dst.slice(0, 7) + "…" : dst;
+    text = short ? `${num} — ${short}` : num;
   } else {
     const cs = ((vehicle.callsign as string | undefined) ?? "").trim();
     if (!cs) return;
-    primary = cs.length > 7 ? cs.slice(0, 6) + "…" : cs;
+    text = cs.length > 8 ? cs.slice(0, 7) + "…" : cs;
   }
-  if (!primary) return;
 
-  const text = secondary ? `${primary} ← ${secondary}` : primary;
+  // ── Draw the pill ─────────────────────────────────────────────────────────
+  // White background, black border, 11px bold — readable at all zoom levels
   ctx.save();
-  ctx.font = "bold 8px 'Heebo',system-ui,sans-serif";
+  ctx.font = "bold 11px 'Heebo',system-ui,sans-serif";
   ctx.textAlign = "center";
   ctx.textBaseline = "middle";
 
   const tw = ctx.measureText(text).width;
-  const pw = tw + 10, ph = 13;
-  const px = x - pw / 2, py = y - 24 - ph;
+  const pw = tw + 14;   // horizontal padding
+  const ph = 17;        // pill height
+  const px = x - pw / 2;
+  const py = y - 26 - ph;   // sit just above the vehicle body
 
-  ctx.shadowBlur = 5; ctx.shadowColor = "rgba(0,0,0,0.12)";
-  ctx.fillStyle = "rgba(255,255,255,0.97)";
-  rRect(ctx, px, py, pw, ph, 3); ctx.fill();
+  // Drop shadow for depth
+  ctx.shadowBlur  = 4;
+  ctx.shadowColor = "rgba(0,0,0,0.25)";
+
+  // Solid white fill
+  ctx.fillStyle = "#ffffff";
+  rRect(ctx, px, py, pw, ph, 4);
+  ctx.fill();
   ctx.shadowBlur = 0;
-  ctx.strokeStyle = color + "cc"; ctx.lineWidth = 1;
-  rRect(ctx, px, py, pw, ph, 3); ctx.stroke();
-  ctx.fillStyle = "#1e1b4b";
+
+  // Black border (1.5px) — readable on any map tile colour
+  ctx.strokeStyle = "rgba(0,0,0,0.75)";
+  ctx.lineWidth   = 1.5;
+  rRect(ctx, px, py, pw, ph, 4);
+  ctx.stroke();
+
+  // Text: near-black
+  ctx.fillStyle = "#111111";
   ctx.fillText(text, x, py + ph / 2);
+
   ctx.restore();
 }
 

@@ -126,11 +126,19 @@ export default function VehiclePopup({
         {/* ── BUS INFO ── */}
         {vehicle.type === "bus" && (
           <>
+            {s("destination_name") && (
+              <div className="flex items-center gap-1.5">
+                <ArrowRight size={13} style={{ color, flexShrink: 0 }} />
+                <span className="text-sm font-bold" style={{ color: "#1e1b4b", direction: "rtl" }}>
+                  {s("destination_name")}
+                </span>
+              </div>
+            )}
+            {s("route_short_name") && (
+              <Row label="קו" value={s("route_short_name")!} valueColor={color} />
+            )}
             {operator && (
               <Row label="Operator" value={OPERATOR_NAMES[operator] ?? `Operator ${operator}`} />
-            )}
-            {s("journey_ref") && (
-              <Row label="Journey" value={s("journey_ref")!.split("-").slice(-1)[0]} mono />
             )}
           </>
         )}
