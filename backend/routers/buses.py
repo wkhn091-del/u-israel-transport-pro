@@ -66,7 +66,9 @@ async def get_live_buses(
       5. Dedup by vehicle_ref (keep only latest position per physical bus)
     """
     print(f">>> CURRENT TIME IN ISRAEL: {datetime.now(pytz.timezone('Asia/Jerusalem'))}")
-    radius_km = max(2.0, haversine_km(lat_min, lon_min, lat_max, lon_max) / 2)
+    # Use the actual requested bbox radius (no artificial 2 km floor).
+    # The Hasadna API returns a broader set; we filter server-side below.
+    radius_km = max(0.5, haversine_km(lat_min, lon_min, lat_max, lon_max) / 2)
 
     try:
         buses = await fetch_live_vehicles(
@@ -75,8 +77,8 @@ async def get_live_buses(
             radius_km=radius_km,
             limit=limit,
         )
-        # Hard distance cap: never send buses > 3 km from Tiberias to the frontend
-        buses = [b for b in buses if b.get("dist_km", 999) < 3.0]
+        # Hard distance cap: never send buses > 800 m from Tiberias to the frontend
+        buses = [b for b in buses if b.get("dist_km", 999) < 0.8]
         return {
             "buses":     buses,
             "count":     len(buses),
@@ -219,7 +221,7 @@ async def get_station_board(
 
 @router.get("/tiberias-board")
 async def get_tiberias_board(
-    radius_km:    float       = Query(default=1.5, le=5.0),
+    radius_km:    float       = Query(default=0.5, le=5.0),
     window_hours: int         = Query(default=2, le=6),
     line:         str | None  = Query(default=None),
 ):

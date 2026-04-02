@@ -1,9 +1,6 @@
 "use client";
 import { useEffect, useState, useCallback, useRef } from "react";
-import {
-  Search, X, Bus, Clock, RefreshCw, MapPin,
-  ChevronRight, AlertCircle, Loader2, Radio,
-} from "lucide-react";
+import { Search, X, RefreshCw, Clock, Loader2, AlertCircle, MapPin, ChevronLeft } from "lucide-react";
 
 interface Stop {
   id: number;
@@ -56,6 +53,168 @@ interface TiberiasBoard {
 const API = "http://localhost:8001/api/buses";
 const REFRESH_INTERVAL_MS = 30_000;
 
+const PURPLE = "#6B3FA0";
+const PURPLE_LIGHT = "#F3EEFF";
+const PURPLE_DIM = "#D8C8F5";
+
+function etaMinutes(a: Arrival): number {
+  return a.eta_minutes;
+}
+
+function etaColor(mins: number): string {
+  if (mins < 0) return "#8E8E93";
+  if (mins <= 2) return "#FF3B30";
+  if (mins <= 8) return "#FF9500";
+  return PURPLE;
+}
+
+function formatMins(a: Arrival): string {
+  const mins = a.eta_minutes;
+  if (mins < -1) return "עבר";
+  if (mins === 0) return "עכשיו";
+  if (mins > 60) return a.aimed_display || a.scheduled_display || "—";
+  return String(mins);
+}
+
+// ── Arrival row: [time | destination | line-badge] ──────────────────────────
+function ArrivalRow({ arrival: a }: { arrival: Arrival }) {
+  const mins     = etaMinutes(a);
+  const departed = mins < -1;
+  const color    = etaColor(mins);
+  const lineLabel =
+    a.route_short_name || (a.line_ref != null ? String(a.line_ref) : "?");
+  const dest = a.destination || "—";
+  const minsText = formatMins(a);
+  const showDqUnit = !departed && mins > 0 && mins <= 60;
+
+  return (
+    <div
+      style={{
+        display: "flex",
+        alignItems: "center",
+        padding: "11px 16px",
+        borderBottom: "1px solid #F0F0F5",
+        opacity: departed ? 0.45 : 1,
+        direction: "rtl",
+        background: "#FFFFFF",
+      }}
+    >
+      {/* ── Left: time block ── */}
+      <div style={{ width: 62, flexShrink: 0 }}>
+        <div style={{ display: "flex", alignItems: "baseline", gap: 3 }}>
+          {a.is_realtime && !departed && (
+            <span
+              style={{
+                width: 7, height: 7, borderRadius: "50%",
+                background: "#34C759", display: "inline-block",
+                flexShrink: 0, marginBottom: 1,
+              }}
+            />
+          )}
+          <span style={{ fontWeight: 800, fontSize: 20, color, lineHeight: 1 }}>
+            {minsText}
+          </span>
+          {showDqUnit && (
+            <span style={{ fontWeight: 600, fontSize: 11, color }}>דק&apos;</span>
+          )}
+        </div>
+        <div style={{ fontSize: 11, color: "#8E8E93", marginTop: 2 }}>
+          {a.aimed_display || a.scheduled_display || ""}
+        </div>
+      </div>
+
+      {/* ── Middle: destination ── */}
+      <div
+        style={{
+          flex: 1,
+          padding: "0 12px",
+          overflow: "hidden",
+          minWidth: 0,
+        }}
+      >
+        <div
+          style={{
+            fontSize: 14,
+            fontWeight: 600,
+            color: "#1C1C1E",
+            whiteSpace: "nowrap",
+            overflow: "hidden",
+            textOverflow: "ellipsis",
+            direction: "rtl",
+          }}
+        >
+          {dest}
+        </div>
+      </div>
+
+      {/* ── Right: line badge ── */}
+      <div
+        style={{
+          width: 38,
+          height: 38,
+          borderRadius: 11,
+          background: PURPLE,
+          color: "#FFFFFF",
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "center",
+          fontWeight: 800,
+          fontSize: lineLabel.length > 3 ? 9 : lineLabel.length > 2 ? 11 : 15,
+          flexShrink: 0,
+          boxShadow: `0 2px 8px ${PURPLE}44`,
+        }}
+      >
+        {lineLabel}
+      </div>
+    </div>
+  );
+}
+
+// ── Station group header + its rows ─────────────────────────────────────────
+function StationGroup({
+  stopCode,
+  stopName,
+  stopCity,
+  arrivals,
+}: {
+  stopCode: number | string;
+  stopName: string;
+  stopCity?: string;
+  arrivals: Arrival[];
+}) {
+  const heading = stopCity ? `${stopName} / ${stopCity}` : stopName;
+  return (
+    <div>
+      {/* Station header */}
+      <div
+        style={{
+          padding: "8px 16px 6px",
+          background: "#F7F7FB",
+          borderBottom: "1px solid #EBEBF0",
+          borderTop: "1px solid #EBEBF0",
+          direction: "rtl",
+        }}
+      >
+        <div style={{ fontWeight: 700, fontSize: 13, color: "#1C1C1E" }}>
+          {heading}
+        </div>
+        <div style={{ fontSize: 11, color: "#8E8E93", marginTop: 1 }}>
+          תחנה מס&apos; {stopCode}
+        </div>
+      </div>
+
+      {/* Arrival rows */}
+      {arrivals.map((a, i) => (
+        <ArrivalRow
+          key={`${a.vehicle_ref ?? a.line_ref}-${a.stop_code}-${i}`}
+          arrival={a}
+        />
+      ))}
+    </div>
+  );
+}
+
+// ── Main component ───────────────────────────────────────────────────────────
 export default function StationBoard({
   initialStopCode,
   onClose,
@@ -63,33 +222,33 @@ export default function StationBoard({
   initialStopCode: number | null;
   onClose: () => void;
 }) {
-  const [mode, setMode]             = useState<"single" | "tiberias">("single");
-  const [query, setQuery]           = useState("");
-  const [cityQuery, setCityQuery]   = useState("");
-  const [stops, setStops]           = useState<Stop[]>([]);
+  const [mode, setMode]               = useState<"single" | "tiberias">("tiberias");
+  const [query, setQuery]             = useState("");
+  const [cityQuery, setCityQuery]     = useState("");
+  const [stops, setStops]             = useState<Stop[]>([]);
   const [stopsLoading, setStopsLoading] = useState(false);
   const [selectedStop, setSelectedStop] = useState<Stop | null>(null);
-  const [board, setBoard]           = useState<BoardData | null>(null);
+  const [board, setBoard]             = useState<BoardData | null>(null);
   const [boardLoading, setBoardLoading] = useState(false);
-  const [tibBoard, setTibBoard]     = useState<TiberiasBoard | null>(null);
-  const [tibLoading, setTibLoading] = useState(false);
-  const [lineFilter, setLineFilter] = useState("");
-  const lineFilterRef               = useRef(lineFilter);
-  const [lastRefresh, setLastRefresh]   = useState("");
-  const [countdown, setCountdown]       = useState(REFRESH_INTERVAL_MS / 1000);
-  const refreshTimer   = useRef<ReturnType<typeof setInterval> | null>(null);
-  const countdownTimer = useRef<ReturnType<typeof setInterval> | null>(null);
+  const [tibBoard, setTibBoard]       = useState<TiberiasBoard | null>(null);
+  const [tibLoading, setTibLoading]   = useState(false);
+  const [lineFilter, setLineFilter]   = useState("");
+  const lineFilterRef                 = useRef(lineFilter);
+  const [lastRefresh, setLastRefresh] = useState("");
+  const [countdown, setCountdown]     = useState(REFRESH_INTERVAL_MS / 1000);
+  const refreshTimer                  = useRef<ReturnType<typeof setInterval> | null>(null);
+  const countdownTimer                = useRef<ReturnType<typeof setInterval> | null>(null);
 
-  // Keep ref in sync for use inside stable callbacks
   useEffect(() => { lineFilterRef.current = lineFilter; }, [lineFilter]);
 
-  // ── Auto-load if a stop code was passed from map click ──────────────────
+  // Auto-load when a stop code is passed from a map click
   useEffect(() => {
     if (!initialStopCode) return;
+    setMode("single");
     loadBoard(initialStopCode);
   }, [initialStopCode]); // eslint-disable-line
 
-  // ── Stop search ──────────────────────────────────────────────────────────
+  // Stop search
   const searchStops = useCallback(async () => {
     if (!cityQuery.trim() && !query.trim()) return;
     setStopsLoading(true);
@@ -107,7 +266,7 @@ export default function StationBoard({
     }
   }, [cityQuery, query]);
 
-  // ── Single-stop board fetch ──────────────────────────────────────────────
+  // Single-stop board fetch
   const loadBoard = useCallback(async (stopCode: number) => {
     setBoardLoading(true);
     setBoard(null);
@@ -133,7 +292,7 @@ export default function StationBoard({
     }
   }, []);
 
-  // ── Tiberias board fetch (reads lineFilter via ref — stable function) ────
+  // Tiberias board fetch
   const loadTiberiasBoard = useCallback(async () => {
     setTibLoading(true);
     try {
@@ -152,9 +311,9 @@ export default function StationBoard({
     } finally {
       setTibLoading(false);
     }
-  }, []); // stable: reads filter via lineFilterRef
+  }, []);
 
-  // ── Auto-refresh (single stop) ───────────────────────────────────────────
+  // Auto-refresh for single stop
   useEffect(() => {
     if (mode !== "single" || !selectedStop) return;
     if (refreshTimer.current)  clearInterval(refreshTimer.current);
@@ -169,7 +328,7 @@ export default function StationBoard({
     };
   }, [selectedStop, mode, loadBoard]);
 
-  // ── Auto-load + auto-refresh (tiberias) ─────────────────────────────────
+  // Auto-load + auto-refresh for Tiberias
   useEffect(() => {
     if (mode !== "tiberias") return;
     loadTiberiasBoard();
@@ -192,131 +351,226 @@ export default function StationBoard({
     loadBoard(stop.code);
   };
 
-  const etaColor = (mins: number) => {
-    if (mins < 0)   return "#475569";
-    if (mins === 0) return "#ef4444";
-    if (mins <= 5)  return "#f97316";
-    if (mins <= 15) return "#eab308";
-    return "#22c55e";
-  };
-
-  const formatEta = (a: Arrival): string => {
-    if (a.eta_display.startsWith("מחר")) return "מחר";
-    if (a.eta_minutes > 60) return a.aimed_display || a.scheduled_display || "—";
-    return a.eta_display;
-  };
+  // Group Tiberias arrivals by stop code
+  const groupedStops = tibBoard
+    ? tibBoard.arrivals.reduce(
+        (acc, a) => {
+          const key = a.stop_code ?? 0;
+          if (!acc[key]) {
+            const meta = tibBoard.stops.find((s) => s.code === key);
+            acc[key] = { name: a.stop_name ?? meta?.name ?? `תחנה ${key}`, arrivals: [] };
+          }
+          acc[key].arrivals.push(a);
+          return acc;
+        },
+        {} as Record<number, { name: string; arrivals: Arrival[] }>
+      )
+    : {};
 
   return (
-    <div className="flex flex-col flex-1 overflow-hidden" style={{ background: "#080d18" }}>
-
-      {/* ── Header ── */}
-      <div className="flex items-center gap-3 px-5 py-4 border-b flex-shrink-0"
-        style={{ background: "#0f1623", borderColor: "#253047" }}>
-        <div className="p-2 rounded-xl" style={{ background: "#22c55e18", border: "1px solid #22c55e33" }}>
-          <Bus size={18} style={{ color: "#22c55e" }} />
-        </div>
-        <div className="flex-1 min-w-0">
-          <div className="font-bold text-white text-sm">לוח הגעות בזמן אמת</div>
-          <div className="text-xs truncate" style={{ color: "#475569" }}>
+    <div
+      style={{
+        display: "flex",
+        flexDirection: "column",
+        height: "100%",
+        background: "#FFFFFF",
+        direction: "rtl",
+      }}
+    >
+      {/* ── Top header ── */}
+      <div
+        style={{
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "space-between",
+          padding: "14px 16px 12px",
+          borderBottom: "1px solid #EBEBF0",
+          background: "#FFFFFF",
+          flexShrink: 0,
+        }}
+      >
+        <div>
+          <div style={{ fontWeight: 800, fontSize: 17, color: "#1C1C1E" }}>
+            לוח הגעות
+          </div>
+          <div style={{ fontSize: 12, color: "#8E8E93", marginTop: 2 }}>
             {mode === "tiberias"
-              ? "כל התחנות ברדיוס 1.5ק״מ סביב טבריה"
+              ? "תחנות סביב טבריה · 1.5ק״מ"
               : selectedStop
               ? `${selectedStop.name} · ${selectedStop.city}`
               : "חפש תחנת אוטובוס"}
           </div>
         </div>
-        <button onClick={onClose} className="p-1.5 rounded-lg flex-shrink-0"
-          style={{ color: "#475569" }}
-          onMouseEnter={(e) => (e.currentTarget.style.color = "#e2e8f0")}
-          onMouseLeave={(e) => (e.currentTarget.style.color = "#475569")}>
+        <button
+          onClick={onClose}
+          style={{
+            width: 32, height: 32, borderRadius: 16,
+            background: "#F0F0F5", border: "none",
+            display: "flex", alignItems: "center", justifyContent: "center",
+            cursor: "pointer", color: "#3C3C43",
+          }}
+        >
           <X size={16} />
         </button>
       </div>
 
       {/* ── Mode tabs ── */}
-      <div className="flex px-4 pt-3 pb-2 gap-2 flex-shrink-0"
-        style={{ borderBottom: "1px solid #1e293b" }}>
-        <button
-          onClick={() => setMode("single")}
-          className="flex-1 py-1.5 rounded-lg text-xs font-semibold"
-          style={{
-            background: mode === "single" ? "#22c55e22" : "transparent",
-            color:      mode === "single" ? "#22c55e"   : "#475569",
-            border:     `1px solid ${mode === "single" ? "#22c55e44" : "#253047"}`,
-          }}
-        >
-          תחנה בודדת
-        </button>
-        <button
-          onClick={() => setMode("tiberias")}
-          className="flex-1 py-1.5 rounded-lg text-xs font-semibold"
-          style={{
-            background: mode === "tiberias" ? "#22c55e22" : "transparent",
-            color:      mode === "tiberias" ? "#22c55e"   : "#475569",
-            border:     `1px solid ${mode === "tiberias" ? "#22c55e44" : "#253047"}`,
-          }}
-        >
-          לוח טבריה
-        </button>
+      <div
+        style={{
+          display: "flex",
+          gap: 8,
+          padding: "10px 14px",
+          borderBottom: "1px solid #EBEBF0",
+          flexShrink: 0,
+        }}
+      >
+        {(["single", "tiberias"] as const).map((m) => (
+          <button
+            key={m}
+            onClick={() => setMode(m)}
+            style={{
+              flex: 1,
+              padding: "8px 0",
+              borderRadius: 12,
+              border: "none",
+              background: mode === m ? PURPLE : "#F5F5F7",
+              color: mode === m ? "#FFFFFF" : "#6E6E73",
+              fontWeight: 700,
+              fontSize: 13,
+              cursor: "pointer",
+              transition: "background 0.15s",
+            }}
+          >
+            {m === "single" ? "תחנה בודדת" : "לוח טבריה"}
+          </button>
+        ))}
       </div>
 
-      {/* ── Single-stop search ── */}
+      {/* ── Single-stop search bar ── */}
       {mode === "single" && (
-        <div className="px-4 py-3 border-b flex-shrink-0" style={{ borderColor: "#1e293b" }}>
-          <div className="flex gap-2">
-            <div className="relative flex-1">
-              <Search size={14} className="absolute left-3 top-1/2 -translate-y-1/2" style={{ color: "#475569" }} />
+        <div
+          style={{
+            padding: "10px 14px",
+            borderBottom: "1px solid #EBEBF0",
+            flexShrink: 0,
+          }}
+        >
+          <div style={{ display: "flex", gap: 8 }}>
+            <div style={{ flex: 1, position: "relative" }}>
+              <Search
+                size={13}
+                style={{
+                  position: "absolute", right: 10, top: "50%",
+                  transform: "translateY(-50%)", color: "#8E8E93",
+                  pointerEvents: "none",
+                }}
+              />
               <input
                 value={cityQuery}
                 onChange={(e) => setCityQuery(e.target.value)}
                 onKeyDown={(e) => e.key === "Enter" && searchStops()}
-                placeholder="עיר (e.g. תל אביב)"
-                className="w-full pl-8 pr-3 py-2 rounded-lg text-sm outline-none"
-                style={{ background: "#161f30", border: "1px solid #253047", color: "#e2e8f0" }}
+                placeholder="עיר (e.g. טבריה)"
+                style={{
+                  width: "100%",
+                  padding: "8px 30px 8px 10px",
+                  borderRadius: 10,
+                  border: "1px solid #DCDCE0",
+                  fontSize: 13,
+                  color: "#1C1C1E",
+                  background: "#F7F7F9",
+                  outline: "none",
+                  direction: "rtl",
+                  boxSizing: "border-box",
+                }}
               />
             </div>
-            <div className="relative w-28">
-              <input
-                value={query}
-                onChange={(e) => setQuery(e.target.value)}
-                onKeyDown={(e) => e.key === "Enter" && searchStops()}
-                placeholder="קוד תחנה"
-                className="w-full px-3 py-2 rounded-lg text-sm outline-none"
-                style={{ background: "#161f30", border: "1px solid #253047", color: "#e2e8f0" }}
-              />
-            </div>
+            <input
+              value={query}
+              onChange={(e) => setQuery(e.target.value)}
+              onKeyDown={(e) => e.key === "Enter" && searchStops()}
+              placeholder="קוד תחנה"
+              style={{
+                width: 90,
+                padding: "8px 10px",
+                borderRadius: 10,
+                border: "1px solid #DCDCE0",
+                fontSize: 13,
+                color: "#1C1C1E",
+                background: "#F7F7F9",
+                outline: "none",
+                direction: "rtl",
+                boxSizing: "border-box",
+              }}
+            />
             <button
               onClick={searchStops}
-              className="px-3 py-2 rounded-lg text-sm font-medium flex-shrink-0"
-              style={{ background: "#22c55e22", color: "#22c55e", border: "1px solid #22c55e44" }}
+              style={{
+                padding: "8px 14px",
+                borderRadius: 10,
+                border: "none",
+                background: PURPLE,
+                color: "#FFFFFF",
+                fontWeight: 700,
+                fontSize: 13,
+                cursor: "pointer",
+                flexShrink: 0,
+                display: "flex",
+                alignItems: "center",
+                gap: 5,
+              }}
             >
-              {stopsLoading ? <Loader2 size={14} className="animate-spin" /> : "חפש"}
+              {stopsLoading ? <Loader2 size={13} className="animate-spin" /> : "חפש"}
             </button>
           </div>
 
           {stops.length > 0 && (
-            <div className="mt-2 rounded-xl overflow-hidden border max-h-48 overflow-y-auto"
-              style={{ background: "#0f1623", borderColor: "#253047" }}>
+            <div
+              style={{
+                marginTop: 8,
+                borderRadius: 12,
+                border: "1px solid #DCDCE0",
+                overflow: "hidden",
+                maxHeight: 200,
+                overflowY: "auto",
+                background: "#FFFFFF",
+                boxShadow: "0 4px 16px rgba(0,0,0,0.08)",
+              }}
+            >
               {stops.map((stop) => (
                 <button
                   key={stop.code}
                   onClick={() => handleStopSelect(stop)}
-                  className="flex items-center gap-2 w-full px-3 py-2.5 text-left text-sm"
-                  style={{ borderBottom: "1px solid #1e293b", color: "#cbd5e1" }}
-                  onMouseEnter={(e) => ((e.currentTarget as HTMLElement).style.background = "#161f30")}
+                  style={{
+                    display: "flex",
+                    alignItems: "center",
+                    gap: 8,
+                    width: "100%",
+                    padding: "10px 12px",
+                    borderBottom: "1px solid #F0F0F5",
+                    background: "transparent",
+                    border: "none",
+                    cursor: "pointer",
+                    textAlign: "right",
+                    direction: "rtl",
+                  }}
+                  onMouseEnter={(e) => ((e.currentTarget as HTMLElement).style.background = "#F7F7F9")}
                   onMouseLeave={(e) => ((e.currentTarget as HTMLElement).style.background = "transparent")}
                 >
-                  <MapPin size={13} style={{ color: "#22c55e", flexShrink: 0 }} />
-                  <span className="flex-1 truncate">{stop.name}</span>
-                  <span className="text-xs" style={{ color: "#475569" }}>{stop.city}</span>
-                  <span className="text-xs font-mono" style={{ color: "#334155" }}>#{stop.code}</span>
-                  <ChevronRight size={12} style={{ color: "#334155", flexShrink: 0 }} />
+                  <MapPin size={13} style={{ color: PURPLE, flexShrink: 0 }} />
+                  <span style={{ flex: 1, fontSize: 13, color: "#1C1C1E", fontWeight: 500 }}>
+                    {stop.name}
+                  </span>
+                  <span style={{ fontSize: 11, color: "#8E8E93" }}>{stop.city}</span>
+                  <span style={{ fontSize: 11, color: "#C0C0CC", fontFamily: "monospace" }}>
+                    #{stop.code}
+                  </span>
+                  <ChevronLeft size={12} style={{ color: "#C0C0CC" }} />
                 </button>
               ))}
             </div>
           )}
           {stops.length === 0 && !stopsLoading && cityQuery && (
-            <div className="mt-2 text-xs text-center py-2" style={{ color: "#475569" }}>
+            <div style={{ marginTop: 8, fontSize: 12, color: "#8E8E93", textAlign: "center" }}>
               לא נמצאו תחנות — נסה שם עיר אחר
             </div>
           )}
@@ -325,78 +579,150 @@ export default function StationBoard({
 
       {/* ── Tiberias line filter ── */}
       {mode === "tiberias" && (
-        <div className="px-4 py-3 border-b flex-shrink-0" style={{ borderColor: "#1e293b" }}>
-          <div className="flex gap-2">
-            <div className="relative flex-1">
-              <Search size={14} className="absolute left-3 top-1/2 -translate-y-1/2" style={{ color: "#475569" }} />
-              <input
-                value={lineFilter}
-                onChange={(e) => setLineFilter(e.target.value)}
-                onKeyDown={(e) => e.key === "Enter" && loadTiberiasBoard()}
-                placeholder="סנן לפי קו (e.g. 6, 430)"
-                className="w-full pl-8 pr-3 py-2 rounded-lg text-sm outline-none"
-                style={{ background: "#161f30", border: "1px solid #253047", color: "#e2e8f0" }}
-              />
-            </div>
-            <button
-              onClick={loadTiberiasBoard}
-              className="px-3 py-2 rounded-lg text-sm font-medium flex-shrink-0"
-              style={{ background: "#22c55e22", color: "#22c55e", border: "1px solid #22c55e44" }}
-            >
-              {tibLoading ? <Loader2 size={14} className="animate-spin" /> : "סנן"}
-            </button>
+        <div
+          style={{
+            padding: "10px 14px",
+            borderBottom: "1px solid #EBEBF0",
+            flexShrink: 0,
+            display: "flex",
+            gap: 8,
+          }}
+        >
+          <div style={{ flex: 1, position: "relative" }}>
+            <Search
+              size={13}
+              style={{
+                position: "absolute", right: 10, top: "50%",
+                transform: "translateY(-50%)", color: "#8E8E93",
+                pointerEvents: "none",
+              }}
+            />
+            <input
+              value={lineFilter}
+              onChange={(e) => setLineFilter(e.target.value)}
+              onKeyDown={(e) => e.key === "Enter" && loadTiberiasBoard()}
+              placeholder="סנן לפי קו (e.g. 6, 430)"
+              style={{
+                width: "100%",
+                padding: "8px 30px 8px 10px",
+                borderRadius: 10,
+                border: "1px solid #DCDCE0",
+                fontSize: 13,
+                color: "#1C1C1E",
+                background: "#F7F7F9",
+                outline: "none",
+                direction: "rtl",
+                boxSizing: "border-box",
+              }}
+            />
           </div>
+          <button
+            onClick={loadTiberiasBoard}
+            style={{
+              padding: "8px 14px",
+              borderRadius: 10,
+              border: "none",
+              background: PURPLE,
+              color: "#FFFFFF",
+              fontWeight: 700,
+              fontSize: 13,
+              cursor: "pointer",
+              flexShrink: 0,
+              display: "flex",
+              alignItems: "center",
+              gap: 5,
+            }}
+          >
+            {tibLoading ? <Loader2 size={13} className="animate-spin" /> : "סנן"}
+          </button>
         </div>
       )}
 
-      {/* ── Scrollable content area ── */}
-      <div className="flex-1 overflow-y-auto">
+      {/* ── Scrollable content ── */}
+      <div style={{ flex: 1, overflowY: "auto", background: "#FAFAFA" }}>
 
         {/* ══ SINGLE STOP MODE ══ */}
         {mode === "single" && (
           <>
             {boardLoading && (
-              <div className="flex flex-col items-center justify-center h-48 gap-3">
-                <Loader2 size={28} className="animate-spin" style={{ color: "#22c55e" }} />
-                <span className="text-sm" style={{ color: "#475569" }}>טוען נתוני הגעה…</span>
+              <div
+                style={{
+                  display: "flex", flexDirection: "column",
+                  alignItems: "center", justifyContent: "center",
+                  height: 200, gap: 12,
+                }}
+              >
+                <Loader2 size={28} className="animate-spin" style={{ color: PURPLE }} />
+                <span style={{ fontSize: 13, color: "#8E8E93" }}>טוען נתוני הגעה…</span>
               </div>
             )}
 
             {!boardLoading && board && (
               <>
-                {/* Stop info card */}
-                <div className="mx-4 mt-4 p-3 rounded-xl"
-                  style={{ background: "#0f1623", border: "1px solid #253047" }}>
-                  <div className="flex items-start justify-between">
-                    <div className="min-w-0 flex-1">
-                      <div className="font-bold text-sm text-white truncate">{board.stop_name}</div>
-                      <div className="text-xs mt-0.5" style={{ color: "#475569" }}>
-                        {board.stop_city && <span>{board.stop_city} · </span>}
-                        <span className="font-mono">#{board.stop_code}</span>
+                {/* Station header card */}
+                <div
+                  style={{
+                    margin: "12px 14px 0",
+                    borderRadius: 14,
+                    background: "#FFFFFF",
+                    border: "1px solid #EBEBF0",
+                    padding: "12px 14px",
+                    boxShadow: "0 1px 6px rgba(0,0,0,0.05)",
+                  }}
+                >
+                  <div
+                    style={{
+                      display: "flex",
+                      alignItems: "flex-start",
+                      justifyContent: "space-between",
+                      direction: "rtl",
+                    }}
+                  >
+                    <div style={{ minWidth: 0, flex: 1 }}>
+                      <div style={{ fontWeight: 700, fontSize: 15, color: "#1C1C1E" }}>
+                        {board.stop_name}
+                        {board.stop_city ? ` / ${board.stop_city}` : ""}
                       </div>
-                      {board.stop_lat && (
-                        <div className="text-xs mt-0.5 font-mono" style={{ color: "#334155" }}>
-                          {board.stop_lat.toFixed(4)}, {board.stop_lon?.toFixed(4)}
-                        </div>
-                      )}
+                      <div style={{ fontSize: 12, color: "#8E8E93", marginTop: 2 }}>
+                        תחנה מס&apos; {board.stop_code}
+                      </div>
                     </div>
                     <button
                       onClick={() => loadBoard(board.stop_code)}
-                      className="p-1.5 rounded-lg ml-2 flex-shrink-0"
-                      style={{ color: "#475569", background: "#161f30" }}
+                      style={{
+                        width: 30, height: 30, borderRadius: 10,
+                        background: PURPLE_LIGHT, border: `1px solid ${PURPLE_DIM}`,
+                        display: "flex", alignItems: "center", justifyContent: "center",
+                        cursor: "pointer", flexShrink: 0, marginRight: 8,
+                        color: PURPLE,
+                      }}
                       title="רענן"
                     >
                       <RefreshCw size={13} />
                     </button>
                   </div>
                   {lastRefresh && (
-                    <div className="flex items-center justify-between mt-2">
-                      <div className="flex items-center gap-1" style={{ color: "#334155" }}>
+                    <div
+                      style={{
+                        display: "flex", alignItems: "center", justifyContent: "space-between",
+                        marginTop: 8, direction: "rtl",
+                      }}
+                    >
+                      <div
+                        style={{
+                          display: "flex", alignItems: "center", gap: 4,
+                          fontSize: 11, color: "#8E8E93",
+                        }}
+                      >
                         <Clock size={11} />
-                        <span className="text-xs">עודכן {lastRefresh}</span>
+                        <span>עודכן {lastRefresh}</span>
                       </div>
-                      <div className="text-xs font-mono"
-                        style={{ color: countdown <= 10 ? "#f59e0b" : "#334155" }}>
+                      <div
+                        style={{
+                          fontSize: 11, fontFamily: "monospace",
+                          color: countdown <= 10 ? "#FF9500" : "#C0C0CC",
+                        }}
+                      >
                         רענון בעוד {countdown}ש׳
                       </div>
                     </div>
@@ -404,120 +730,122 @@ export default function StationBoard({
                 </div>
 
                 {board.service_status === "unavailable" && (
-                  <div className="mx-4 mt-3 p-3 rounded-xl flex items-center gap-2"
-                    style={{ background: "#fef3c715", border: "1px solid #f59e0b44", color: "#f59e0b" }}>
+                  <div
+                    style={{
+                      margin: "10px 14px 0",
+                      padding: "10px 12px",
+                      borderRadius: 12,
+                      background: "#FFF8EC",
+                      border: "1px solid #FFD980",
+                      display: "flex", alignItems: "center", gap: 8,
+                      color: "#B8861A",
+                    }}
+                  >
                     <AlertCircle size={14} />
-                    <span className="text-xs font-semibold">שירות לא זמין כרגע</span>
+                    <span style={{ fontSize: 12, fontWeight: 600 }}>שירות לא זמין כרגע</span>
                   </div>
                 )}
 
                 {board.error && board.service_status !== "unavailable" && (
-                  <div className="mx-4 mt-3 p-3 rounded-xl flex items-center gap-2"
-                    style={{ background: "#ef444415", border: "1px solid #ef444433", color: "#ef4444" }}>
+                  <div
+                    style={{
+                      margin: "10px 14px 0",
+                      padding: "10px 12px",
+                      borderRadius: 12,
+                      background: "#FFF0F0",
+                      border: "1px solid #FFBCBC",
+                      display: "flex", alignItems: "center", gap: 8,
+                      color: "#D03030",
+                    }}
+                  >
                     <AlertCircle size={14} />
-                    <span className="text-xs">{board.error}</span>
+                    <span style={{ fontSize: 12 }}>{board.error}</span>
                   </div>
                 )}
 
                 {board.arrivals.length === 0 && !board.error && (
-                  <div className="mx-4 mt-3 p-4 rounded-xl text-center"
-                    style={{ background: "#0f1623", border: "1px dashed #253047", color: "#475569" }}>
-                    <Bus size={24} className="mx-auto mb-2 opacity-40" />
-                    <div className="text-sm">אין יציאות בשעתיים הקרובות</div>
-                    <div className="text-xs mt-1" style={{ color: "#334155" }}>
+                  <div
+                    style={{
+                      margin: "10px 14px 0",
+                      padding: "24px 16px",
+                      borderRadius: 14,
+                      background: "#FFFFFF",
+                      border: "1px dashed #DCDCE0",
+                      textAlign: "center", color: "#8E8E93",
+                    }}
+                  >
+                    <div style={{ fontSize: 13, fontWeight: 600 }}>
+                      אין יציאות בשעתיים הקרובות
+                    </div>
+                    <div style={{ fontSize: 11, marginTop: 4, color: "#C0C0CC" }}>
                       No scheduled departures in the next 2 hours
                     </div>
                   </div>
                 )}
 
                 {board.arrivals.length > 0 && (
-                  <div className="mx-4 mt-3 mb-6 rounded-xl overflow-hidden border"
-                    style={{ borderColor: "#253047" }}>
-                    <div className="grid px-3 py-2 text-xs font-semibold uppercase tracking-wider"
+                  <div
+                    style={{
+                      margin: "10px 14px 16px",
+                      borderRadius: 14,
+                      overflow: "hidden",
+                      border: "1px solid #EBEBF0",
+                      background: "#FFFFFF",
+                      boxShadow: "0 1px 6px rgba(0,0,0,0.04)",
+                    }}
+                  >
+                    {/* Station group header */}
+                    <div
                       style={{
-                        gridTemplateColumns: "2fr 2fr 1fr 1.5fr",
-                        background: "#0f1623", color: "#475569",
-                        borderBottom: "1px solid #1e293b",
-                      }}>
-                      <span>קו</span>
-                      <span>מפעיל</span>
-                      <span>מתוכנן</span>
-                      <span className="text-right">ETA</span>
+                        padding: "8px 16px 6px",
+                        background: "#F7F7FB",
+                        borderBottom: "1px solid #EBEBF0",
+                        direction: "rtl",
+                      }}
+                    >
+                      <div style={{ fontWeight: 700, fontSize: 13, color: "#1C1C1E" }}>
+                        {board.stop_name}
+                        {board.stop_city ? ` / ${board.stop_city}` : ""}
+                      </div>
+                      <div style={{ fontSize: 11, color: "#8E8E93", marginTop: 1 }}>
+                        תחנה מס&apos; {board.stop_code}
+                      </div>
                     </div>
 
-                    {board.arrivals.map((a, i) => {
-                      const color     = etaColor(a.eta_minutes);
-                      const departed  = a.eta_minutes < -1;
-                      const lineLabel = a.route_short_name || (a.line_ref != null ? String(a.line_ref) : "?");
-                      const opLabel   = a.agency_name || "—";
-                      const dest      = a.destination || "";
-                      return (
-                        <div
-                          key={`${a.vehicle_ref ?? i}-${i}`}
-                          className="grid items-center px-3 py-3 text-sm"
-                          style={{
-                            gridTemplateColumns: "2fr 2fr 1fr 1.5fr",
-                            background: i % 2 === 0 ? "#080d18" : "#0a0f1e",
-                            borderBottom: "1px solid #0f1623",
-                            opacity: departed ? 0.35 : 1,
-                          }}
-                        >
-                          <div className="flex flex-col gap-0.5">
-                            <div
-                              className="rounded-lg inline-flex items-center justify-center font-bold self-start"
-                              style={{
-                                minWidth: 32, height: 28, padding: "0 5px",
-                                background: "#22c55e22", color: "#22c55e",
-                                border: "1px solid #22c55e33",
-                                fontSize: lineLabel.length > 3 ? 9 : 12,
-                              }}
-                            >
-                              {lineLabel}
-                            </div>
-                            {dest && (
-                              <div className="truncate" style={{ color: "#475569", fontSize: 9, direction: "rtl" }}>
-                                {dest}
-                              </div>
-                            )}
-                          </div>
-                          <div className="text-xs truncate" style={{ color: "#64748b" }}>{opLabel}</div>
-                          <div className="font-mono text-xs" style={{ color: "#64748b" }}>
-                            {a.aimed_display || a.scheduled_display || "—"}
-                          </div>
-                          <div className="text-right flex items-center justify-end gap-1">
-                            {a.is_realtime && (
-                              <Radio size={9} style={{ color: "#22c55e", flexShrink: 0 }} aria-label="Real-time" />
-                            )}
-                            <span className="font-bold text-sm" style={{ color }}>
-                              {departed ? "עבר" : formatEta(a)}
-                            </span>
-                          </div>
-                        </div>
-                      );
-                    })}
-                  </div>
-                )}
-
-                {board.server_time_il && (
-                  <div className="mx-4 mb-4 text-center text-xs" style={{ color: "#1e293b" }}>
-                    שרת: {board.server_time_il} (Asia/Jerusalem)
+                    {board.arrivals.map((a, i) => (
+                      <ArrivalRow
+                        key={`${a.vehicle_ref ?? a.line_ref}-${i}`}
+                        arrival={a}
+                      />
+                    ))}
                   </div>
                 )}
               </>
             )}
 
             {!boardLoading && !board && (
-              <div className="flex flex-col items-center justify-center h-64 gap-4 px-6 text-center">
-                <div className="p-4 rounded-2xl"
-                  style={{ background: "#22c55e10", border: "1px solid #22c55e22" }}>
-                  <Bus size={32} style={{ color: "#22c55e40" }} />
+              <div
+                style={{
+                  display: "flex", flexDirection: "column",
+                  alignItems: "center", justifyContent: "center",
+                  height: 260, gap: 14, padding: "0 24px", textAlign: "center",
+                }}
+              >
+                <div
+                  style={{
+                    width: 64, height: 64, borderRadius: 20,
+                    background: PURPLE_LIGHT, border: `1px solid ${PURPLE_DIM}`,
+                    display: "flex", alignItems: "center", justifyContent: "center",
+                  }}
+                >
+                  <MapPin size={28} style={{ color: PURPLE }} />
                 </div>
                 <div>
-                  <div className="font-semibold text-sm" style={{ color: "#64748b" }}>
+                  <div style={{ fontWeight: 700, fontSize: 14, color: "#3C3C43" }}>
                     חפש תחנה למעלה
                   </div>
-                  <div className="text-xs mt-1" style={{ color: "#334155" }}>
-                    הזן שם עיר (עברית או אנגלית) או קוד תחנה
+                  <div style={{ fontSize: 12, color: "#8E8E93", marginTop: 4 }}>
+                    הזן שם עיר (עברית) או קוד תחנה
                   </div>
                 </div>
               </div>
@@ -529,156 +857,122 @@ export default function StationBoard({
         {mode === "tiberias" && (
           <>
             {tibLoading && (
-              <div className="flex flex-col items-center justify-center h-48 gap-3">
-                <Loader2 size={28} className="animate-spin" style={{ color: "#22c55e" }} />
-                <span className="text-sm" style={{ color: "#475569" }}>טוען לוח טבריה…</span>
+              <div
+                style={{
+                  display: "flex", flexDirection: "column",
+                  alignItems: "center", justifyContent: "center",
+                  height: 200, gap: 12,
+                }}
+              >
+                <Loader2 size={28} className="animate-spin" style={{ color: PURPLE }} />
+                <span style={{ fontSize: 13, color: "#8E8E93" }}>טוען לוח טבריה…</span>
               </div>
             )}
 
             {!tibLoading && tibBoard && (
               <>
-                {/* Stats card */}
-                <div className="mx-4 mt-4 p-3 rounded-xl"
-                  style={{ background: "#0f1623", border: "1px solid #253047" }}>
-                  <div className="flex items-center justify-between">
-                    <div className="min-w-0">
-                      <div className="font-bold text-sm text-white">
-                        {tibBoard.count} הגעות · {tibBoard.stops_found} תחנות
-                      </div>
-                      <div className="text-xs mt-0.5" style={{ color: "#475569" }}>
-                        ברדיוס {tibBoard.radius_km}ק״מ · מרכז טבריה
-                      </div>
-                    </div>
-                    <button
-                      onClick={loadTiberiasBoard}
-                      className="p-1.5 rounded-lg ml-2 flex-shrink-0"
-                      style={{ color: "#475569", background: "#161f30" }}
-                      title="רענן"
-                    >
-                      <RefreshCw size={13} />
-                    </button>
+                {/* Stats pill */}
+                <div
+                  style={{
+                    margin: "10px 14px 0",
+                    display: "flex",
+                    alignItems: "center",
+                    justifyContent: "space-between",
+                    direction: "rtl",
+                  }}
+                >
+                  <div style={{ fontSize: 12, color: "#8E8E93" }}>
+                    {tibBoard.count} הגעות · {tibBoard.stops_found} תחנות
+                    {lastRefresh && ` · עודכן ${lastRefresh}`}
                   </div>
-                  {lastRefresh && (
-                    <div className="flex items-center justify-between mt-2">
-                      <div className="flex items-center gap-1" style={{ color: "#334155" }}>
-                        <Clock size={11} />
-                        <span className="text-xs">עודכן {lastRefresh}</span>
-                      </div>
-                      <div className="text-xs font-mono"
-                        style={{ color: countdown <= 10 ? "#f59e0b" : "#334155" }}>
-                        רענון בעוד {countdown}ש׳
-                      </div>
-                    </div>
-                  )}
+                  <button
+                    onClick={loadTiberiasBoard}
+                    style={{
+                      padding: "5px 10px",
+                      borderRadius: 10,
+                      border: `1px solid ${PURPLE_DIM}`,
+                      background: PURPLE_LIGHT,
+                      color: PURPLE,
+                      fontWeight: 600,
+                      fontSize: 12,
+                      cursor: "pointer",
+                      display: "flex", alignItems: "center", gap: 5,
+                    }}
+                  >
+                    <RefreshCw size={11} />
+                    רענן
+                  </button>
                 </div>
 
                 {tibBoard.error && (
-                  <div className="mx-4 mt-3 p-3 rounded-xl flex items-center gap-2"
-                    style={{ background: "#ef444415", border: "1px solid #ef444433", color: "#ef4444" }}>
+                  <div
+                    style={{
+                      margin: "10px 14px 0",
+                      padding: "10px 12px",
+                      borderRadius: 12,
+                      background: "#FFF0F0",
+                      border: "1px solid #FFBCBC",
+                      display: "flex", alignItems: "center", gap: 8,
+                      color: "#D03030",
+                    }}
+                  >
                     <AlertCircle size={14} />
-                    <span className="text-xs">{tibBoard.error}</span>
+                    <span style={{ fontSize: 12 }}>{tibBoard.error}</span>
                   </div>
                 )}
 
                 {tibBoard.arrivals.length === 0 && !tibBoard.error && (
-                  <div className="mx-4 mt-3 p-4 rounded-xl text-center"
-                    style={{ background: "#0f1623", border: "1px dashed #253047", color: "#475569" }}>
-                    <Bus size={24} className="mx-auto mb-2 opacity-40" />
-                    <div className="text-sm">אין יציאות בטווח</div>
-                    <div className="text-xs mt-1" style={{ color: "#334155" }}>
+                  <div
+                    style={{
+                      margin: "10px 14px 0",
+                      padding: "24px 16px",
+                      borderRadius: 14,
+                      background: "#FFFFFF",
+                      border: "1px dashed #DCDCE0",
+                      textAlign: "center", color: "#8E8E93",
+                    }}
+                  >
+                    <div style={{ fontSize: 13, fontWeight: 600 }}>אין יציאות בטווח</div>
+                    <div style={{ fontSize: 11, marginTop: 4, color: "#C0C0CC" }}>
                       No stops found within {tibBoard.radius_km}km of Tiberias centre
                     </div>
                   </div>
                 )}
 
                 {tibBoard.arrivals.length > 0 && (
-                  <div className="mx-4 mt-3 mb-6 rounded-xl overflow-hidden border"
-                    style={{ borderColor: "#253047" }}>
-                    {/* Table header */}
-                    <div className="grid px-3 py-2 text-xs font-semibold uppercase tracking-wider"
-                      style={{
-                        gridTemplateColumns: "1.2fr 1.2fr 2fr 1fr 1.5fr",
-                        background: "#0f1623", color: "#475569",
-                        borderBottom: "1px solid #1e293b",
-                      }}>
-                      <span>תחנה</span>
-                      <span>קו</span>
-                      <span>יעד</span>
-                      <span>מתוכנן</span>
-                      <span className="text-right">ETA</span>
-                    </div>
-
-                    {tibBoard.arrivals.map((a, i) => {
-                      const color     = etaColor(a.eta_minutes);
-                      const departed  = a.eta_minutes < -1;
-                      const lineLabel = a.route_short_name || (a.line_ref != null ? String(a.line_ref) : "?");
-                      const dest      = a.destination || a.agency_name || "—";
-                      return (
-                        <div
-                          key={`tib-${a.stop_code}-${a.line_ref}-${i}`}
-                          className="grid items-center px-3 py-2.5"
-                          style={{
-                            gridTemplateColumns: "1.2fr 1.2fr 2fr 1fr 1.5fr",
-                            background: i % 2 === 0 ? "#080d18" : "#0a0f1e",
-                            borderBottom: "1px solid #0f1623",
-                            opacity: departed ? 0.35 : 1,
-                          }}
-                        >
-                          {/* Stop code */}
-                          <div className="text-xs font-mono" style={{ color: "#475569" }}>
-                            <span style={{ color: "#22c55e50" }}>#</span>
-                            {a.stop_code ?? "—"}
-                          </div>
-                          {/* Line badge */}
-                          <div>
-                            <div
-                              className="inline-flex items-center justify-center font-bold rounded-lg"
-                              style={{
-                                minWidth: 30, height: 24, padding: "0 5px",
-                                background: "#22c55e22", color: "#22c55e",
-                                border: "1px solid #22c55e33",
-                                fontSize: lineLabel.length > 3 ? 8 : 11,
-                              }}
-                            >
-                              {lineLabel}
-                            </div>
-                          </div>
-                          {/* Destination */}
-                          <div className="text-xs truncate" style={{ color: "#cbd5e1", direction: "rtl" }}>{dest}</div>
-                          {/* Scheduled */}
-                          <div className="font-mono text-xs" style={{ color: "#64748b" }}>
-                            {a.aimed_display || a.scheduled_display || "—"}
-                          </div>
-                          {/* ETA */}
-                          <div className="text-right flex items-center justify-end gap-1">
-                            {a.is_realtime && (
-                              <Radio size={9} style={{ color: "#22c55e" }} aria-label="Live" />
-                            )}
-                            <span className="font-bold text-xs" style={{ color }}>
-                              {departed ? "עבר" : formatEta(a)}
-                            </span>
-                          </div>
-                        </div>
-                      );
-                    })}
-                  </div>
-                )}
-
-                {tibBoard.server_time_il && (
-                  <div className="mx-4 mb-4 text-center text-xs" style={{ color: "#1e293b" }}>
-                    שרת: {tibBoard.server_time_il} (Asia/Jerusalem)
+                  <div
+                    style={{
+                      margin: "10px 14px 16px",
+                      borderRadius: 14,
+                      overflow: "hidden",
+                      border: "1px solid #EBEBF0",
+                      background: "#FFFFFF",
+                      boxShadow: "0 1px 6px rgba(0,0,0,0.04)",
+                    }}
+                  >
+                    {Object.entries(groupedStops).map(([code, group]) => (
+                      <StationGroup
+                        key={code}
+                        stopCode={Number(code)}
+                        stopName={group.name}
+                        arrivals={group.arrivals}
+                      />
+                    ))}
                   </div>
                 )}
               </>
             )}
 
             {!tibLoading && !tibBoard && (
-              <div className="flex flex-col items-center justify-center h-64 gap-4 px-6 text-center">
-                <div className="p-4 rounded-2xl"
-                  style={{ background: "#22c55e10", border: "1px solid #22c55e22" }}>
-                  <Bus size={32} style={{ color: "#22c55e40" }} />
-                </div>
-                <div className="font-semibold text-sm" style={{ color: "#64748b" }}>טוען…</div>
+              <div
+                style={{
+                  display: "flex", flexDirection: "column",
+                  alignItems: "center", justifyContent: "center",
+                  height: 200, gap: 12,
+                }}
+              >
+                <Loader2 size={28} className="animate-spin" style={{ color: PURPLE }} />
+                <span style={{ fontSize: 13, color: "#8E8E93" }}>טוען…</span>
               </div>
             )}
           </>

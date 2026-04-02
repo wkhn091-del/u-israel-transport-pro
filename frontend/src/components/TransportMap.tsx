@@ -47,7 +47,7 @@ const STOP_MIN_ZOOM   = 14;
 const LABEL_MIN_ZOOM  = 13;
 const GLIDE_MS        = 8000;
 const HIT_RADIUS      = 24;
-const FOCUS_RADIUS_M  = 1000;
+const FOCUS_RADIUS_M  = 500;
 const FOCUS_LAT_DELTA = FOCUS_RADIUS_M / 111_000;
 const COLORS = { train: "#2563eb", bus: "#16a34a", flight: "#d97706" };
 
@@ -788,7 +788,8 @@ export default function TransportMap({
           )
           .on("click", (e: L.LeafletMouseEvent) => {
             L.DomEvent.stopPropagation(e);
-            fetchAndShowStopPopup(stop);
+            // Open StationBoard panel directly for this stop
+            onStopClickRef.current?.(stop.code);
           });
         stopMarkersRef.current.set(stop.code, m);
       }
@@ -963,13 +964,14 @@ export default function TransportMap({
       loadStopsForBounds, showBusLineRoute, showTrainRoute, clearRouteDisplay,
       loadTrainStationsForFocus]);
 
-  // ── 15 s auto-refresh ────────────────────────────────────────────────────────
+  // ── 15 s auto-refresh + initial stop load ────────────────────────────────────
   useEffect(() => {
     if (!mapReady) return;
     fetchAll();
+    loadStopsForBounds(); // load stops immediately without waiting for a pan/zoom
     const id = setInterval(fetchAll, 15_000);
     return () => clearInterval(id);
-  }, [fetchAll, mapReady]);
+  }, [fetchAll, mapReady, loadStopsForBounds]);
 
   // ── Load train stations when focus mode activates ────────────────────────────
   useEffect(() => {
@@ -1021,7 +1023,7 @@ export default function TransportMap({
 
         <button
           onClick={() => onFocusModeChange?.(!focusMode)}
-          title={focusMode ? "יציאה ממצב מיקוד 1 ק\"מ" : "הפעל מצב מיקוד 1 ק\"מ"}
+          title={focusMode ? "יציאה ממצב מיקוד 500מ" : "הפעל מצב מיקוד 500מ"}
           className="flex items-center gap-1.5 px-3 py-2 rounded-xl text-xs font-semibold shadow-lg transition-all"
           style={{
             background: focusMode ? "#7c3aed" : "#ffffffee",
@@ -1032,7 +1034,7 @@ export default function TransportMap({
           }}
         >
           <Target size={13} />
-          {focusMode ? 'מיקוד 1 ק"מ ✓' : 'מצב מיקוד'}
+          {focusMode ? "מיקוד 500מ ✓" : "מצב מיקוד"}
         </button>
       </div>
 
