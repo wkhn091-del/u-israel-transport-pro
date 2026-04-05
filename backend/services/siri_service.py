@@ -463,8 +463,13 @@ async def _fetch_hasadna_stop_monitoring(
         agency = row.get("gtfs_route__agency_name") or ""
         lr     = row.get("gtfs_route__line_ref")
         op     = row.get("gtfs_route__operator_ref")
+        vref   = row.get("siri_ride__vehicle_ref")
 
-        print(f">>> STATION {stop_code}: Line {rsn or lr} arriving at {display_str} (LIVE: False)")
+        # is_realtime=True when SIRI has a vehicle_ref for this ride — the bus
+        # is actively tracked, so show the live indicator in the UI.
+        is_rt  = bool(vref and str(vref).strip() not in ("", "None"))
+
+        print(f">>> STATION {stop_code}: Line {rsn or lr} arriving at {display_str} (LIVE: {is_rt})")
 
         arrivals.append({
             "line_ref":          lr,
@@ -477,8 +482,8 @@ async def _fetch_hasadna_stop_monitoring(
             "eta_display":       display_str,
             "display_type":      display_type,
             "eta_minutes":       eta_min,
-            "is_realtime":       False,   # GTFS = schedule only; no Live badge
-            "vehicle_ref":       row.get("siri_ride__vehicle_ref"),
+            "is_realtime":       is_rt,   # True when SIRI vehicle_ref is present
+            "vehicle_ref":       vref,
             "scheduled_time":    _ts(aimed_at),
             "scheduled_display": _fmt_il(aimed_at),
             "source":            "hasadna_gtfs",
@@ -545,6 +550,82 @@ async def fetch_arrivals_for_stop(
         "fetch_arrivals_for_stop done: %d arrivals  stop=%d", len(arrivals), stop_code
     )
     return arrivals
+
+
+async def fetch_nearby_stops(
+    lat: float,
+    lon: float,
+    radius_m: float = 500,
+) -> list[dict]:
+    """
+    Fetch bus stops within radius_m metres of (lat, lon) from the Hasadna GTFS API.
+
+    Strategy:
+      1. Build an approximate bounding box (lat ± delta, lon ± delta).
+      2. Query the Hasadna /gtfs_stops/list endpoint — it accepts lat/lon bbox via
+         lat_min/lat_max/lon_min/lon_max params but its filtering is unreliable, so
+         we re-filter client-side with haversine.
+      3. Returns a list of dicts: {stop_code, stop_name, lat, lon, dist_m}.
+
+    Never invents data — returns [] on any failure.
+    """
+    today     = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    radius_km = radius_m / 1000.0
+
+    # Degree deltas for the bounding-box pre-filter (generous — haversine cleans up)
+    lat_delta = (radius_km * 1.5) / 111.0
+    lon_delta = (radius_km * 1.5) / (111.0 * math.cos(math.radians(lat)))
+
+    params = {
+        "date_from": today,
+        "limit":     500,
+        "lat_min":   lat - lat_delta,
+        "lat_max":   lat + lat_delta,
+        "lon_min":   lon - lon_delta,
+        "lon_max":   lon + lon_delta,
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            r = await client.get(f"{HASADNA_BASE}/gtfs_stops/list", params=params)
+        if r.status_code != 200:
+            logger.warning("fetch_nearby_stops: HTTP %s", r.status_code)
+            return []
+        raw = r.json()
+        if not isinstance(raw, list):
+            return []
+    except Exception as exc:
+        logger.error("fetch_nearby_stops: request failed: %s", exc)
+        return []
+
+    stops: list[dict] = []
+    seen_codes: set[int] = set()
+    for s in raw:
+        code = s.get("code")
+        slat = s.get("lat")
+        slon = s.get("lon")
+        if code is None or slat is None or slon is None:
+            continue
+        if code in seen_codes:
+            continue
+        dist_km = haversine_km(lat, lon, slat, slon)
+        if dist_km > radius_km:
+            continue
+        seen_codes.add(code)
+        stops.append({
+            "stop_code": code,
+            "stop_name": s.get("name") or f"תחנה {code}",
+            "lat":       slat,
+            "lon":       slon,
+            "dist_m":    int(dist_km * 1000),
+        })
+
+    stops.sort(key=lambda s: s["dist_m"])
+    logger.info(
+        "fetch_nearby_stops: %d stops within %.0fm of %.4f,%.4f",
+        len(stops), radius_m, lat, lon,
+    )
+    return stops
 
 
 async def get_realtime_buses(limit: int = 200) -> list[dict]:

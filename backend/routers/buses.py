@@ -412,6 +412,103 @@ async def get_line_path(
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# /nearby-stops  — STOP-FIRST: all stops within radius + their arrivals
+# ══════════════════════════════════════════════════════════════════════════════
+
+@router.get("/nearby-stops")
+async def get_nearby_stops(
+    lat:       float = Query(default=32.7922),
+    lon:       float = Query(default=35.5312),
+    radius_km: float = Query(default=0.5, le=2.0),
+    city:      str   = Query(default="טבריה"),
+    window_hours: int = Query(default=2, le=6),
+):
+    """
+    Stop-first logic:
+      1. Fetch ALL physical GTFS stops for the given city (reliable city-name filter).
+      2. Haversine-filter to radius_km from (lat, lon).
+      3. For each stop, fetch real-time arrivals concurrently.
+      4. Return as array of stops, each carrying its own arrivals.
+
+    Never invents data — empty arrivals list means no scheduled buses at that stop.
+    """
+    now_utc = datetime.now(timezone.utc)
+    today   = now_utc.strftime("%Y-%m-%d")
+
+    # ── Step 1: fetch all GTFS stops for this city ────────────────────────────
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            r = await client.get(
+                f"{BASE}/gtfs_stops/list",
+                params={"city": city, "date_from": today, "limit": 500},
+                timeout=12.0,
+            )
+        raw_stops = r.json() if r.status_code == 200 else []
+    except Exception as exc:
+        logger.error("nearby-stops: stop fetch failed: %s", exc)
+        return {"stops": [], "count": 0, "error": "Stop data unavailable", "timestamp": int(time.time())}
+
+    if not isinstance(raw_stops, list):
+        return {"stops": [], "count": 0, "error": "Unexpected response from GTFS API", "timestamp": int(time.time())}
+
+    # ── Step 2: haversine filter + deduplicate by stop code ───────────────────
+    nearby: list[dict] = []
+    seen_codes: set[int] = set()
+    for s in raw_stops:
+        slat, slon, code = s.get("lat"), s.get("lon"), s.get("code")
+        if slat is None or slon is None or code is None:
+            continue
+        if code in seen_codes:
+            continue
+        dist_km = haversine_km(lat, lon, slat, slon)
+        if dist_km <= radius_km:
+            seen_codes.add(code)
+            nearby.append({
+                "code":   code,
+                "name":   s.get("name") or f"תחנה {code}",
+                "lat":    slat,
+                "lon":    slon,
+                "dist_m": int(dist_km * 1000),
+            })
+
+    nearby.sort(key=lambda s: s["dist_m"])
+
+    print(f"[nearby-stops] {len(nearby)} stops within {radius_km}km of {lat},{lon} (city={city})")
+
+    if not nearby:
+        return {
+            "stops": [], "count": 0,
+            "message": f"אין תחנות ברדיוס {radius_km}ק\"מ",
+            "timestamp": int(time.time()),
+        }
+
+    # ── Step 3: fetch arrivals for all stops concurrently ────────────────────
+    tasks = [fetch_arrivals_for_stop(s["code"], window_hours) for s in nearby]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    # ── Step 4: attach arrivals to each stop ──────────────────────────────────
+    stops_out: list[dict] = []
+    for stop_meta, arrivals in zip(nearby, results):
+        if isinstance(arrivals, Exception):
+            logger.error("nearby-stops arrivals error for stop %s: %s", stop_meta["code"], arrivals)
+            arrivals = []
+        stop_meta_out = dict(stop_meta)
+        stop_meta_out["arrivals"] = arrivals
+        stops_out.append(stop_meta_out)
+
+    now_il = now_utc.astimezone(IL_TZ)
+    return {
+        "stops":          stops_out,
+        "count":          len(stops_out),
+        "center_lat":     lat,
+        "center_lon":     lon,
+        "radius_km":      radius_km,
+        "server_time_il": now_il.strftime("%H:%M:%S"),
+        "timestamp":      int(time.time()),
+    }
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # /routes  — list SIRI routes
 # ══════════════════════════════════════════════════════════════════════════════
 
